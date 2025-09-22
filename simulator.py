@@ -59,6 +59,7 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
                 continue
 
             start_time_txt = result.findtext('iof:StartTime', namespaces=ns)
+            status_txt = result.findtext('iof:Status', namespaces=ns)
             start_dt = try_parse_time(start_time_txt) if start_time_txt else None
 
             for split in result.findall('iof:SplitTime', ns):
@@ -84,6 +85,7 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
                         'device_id': code,
                         'device_type': guess_device_type(code, None),
                         'raw_time': time_txt,
+                        'status': status_txt or 'OK',
                         'event': 'punch'
                     })
 
@@ -260,7 +262,7 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
 
         minutes_after = random.randint(10, 15)
         dump_ts = last_ts + timedelta(minutes=minutes_after)
-
+        
         # Käytä ALL punches (all_by_runner) dumpissa
         punches = []
         for t, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
@@ -281,6 +283,28 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
             'note': f'dump {minutes_after}min after last punch'
         }
         extra_events.append((dump_ts, dump_event))
+
+        # --- NEW: itkumuuri event ---
+        runner_status = None
+        # look at the last punch for this runner (they all carry status)
+        for _, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
+            if e.get('status'):
+                runner_status = e['status']
+                break
+
+        if runner_status and runner_status not in ("OK", "Finished"):
+            itkumuuri_delay = random.randint(5, 60)
+            itkumuuri_ts = dump_ts + timedelta(minutes=itkumuuri_delay)
+            itkumuuri_event = {
+                'timestamp': itkumuuri_ts.isoformat(),
+                'runner_id': runner,
+                'device_id': f"itkumuuri_{runner}",
+                'device_type': 'itkumuuri',
+                'event': 'itkumuuri',
+                'status': runner_status,
+                'note': f'itkumuuri {itkumuuri_delay}min after dump (status={runner_status})'
+            }
+            extra_events.append((itkumuuri_ts, itkumuuri_event))
 
     # Published timeline: yhdistä published_by_runner tapahtumat (yksittäiset lähetykset)
     published_timeline: List[Tuple[datetime, Dict[str,Any]]] = []
@@ -325,6 +349,16 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
                     'login_time': sent_ts,
                     'note': event.get('note'),
                 }
+            elif event.get('event') == 'itkumuuri':
+                msg_obj = {
+                    'device_id': key,
+                    'device_type': 'itkumuuri',
+                    'runner_id': event.get('runner_id'),
+                    'event': 'itkumuuri',
+                    'status': event.get('status'),
+                    'note': event.get('note'),
+                    'timestamp': sent_ts
+                }
             elif event.get('event') == 'results_dump':
                 shifted_punches = []
                 for p in event.get('punches', []):
@@ -358,10 +392,11 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
                     'status': event.get('status'),
                     'timestamp': sent_ts
                 }
+                
 
             msg = make_message(msg_obj)
             await device_clients[key].send(msg)
-
+                    
         tasks.append(asyncio.create_task(schedule_and_send(delay, ev, ts)))
 
     await asyncio.gather(*tasks)
