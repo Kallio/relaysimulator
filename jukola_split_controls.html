@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jukola/Venla - väliaikarastien rastikoodien kartoittaja</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial;margin:18px;color:#111}
+    label{display:block;margin-top:10px}
+    input[type=text], input[type=number]{width:100%;padding:8px;margin-top:6px;box-sizing:border-box}
+    button{margin-top:12px;padding:8px 12px;border-radius:8px;border:1px solid #888;background:#f5f5f5}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{padding:8px;border:1px solid #ddd;text-align:left} 
+    pre{background:#fafafa;padding:8px;border-radius:6px;border:1px solid #eee}
+    .muted{color:#666;font-size:0.9rem}
+    .error{color:#900}
+  </style>
+</head>
+<body>
+  <h1>Jukola/Venla — väliaikarastien rastikoodien kartoittaja</h1>
+  <p class="muted">Syötä tapahtuman kilpailijat-alkupolku (esim. <code>https://results.jukola.com/tulokset/en/j2025_ju/ju/kilpailijat/</code>) ja joukkueen ID (numero polussa). Skripti hakee joukkueen sivun ja jokaisen juoksijan leimaukset ja yrittää parittaa ne väliaikoihin. Nyt skripti huomioi myös osuuden lähtöajan (offset).</p>
+
+  <label>Kilpailijat-alkupolku (lopeta /-merkkiin):
+    <input id="baseUrl" type="text" value="https://results.jukola.com/tulokset/en/j2025_ju/ju/kilpailijat/" />
+  </label>
+  <label>Joukkueen ID (esim. 7):
+    <input id="teamId" type="text" value="7" />
+  </label>
+  <label>Valinnainen CORS-proxy (jos selain estää haun). Esim. <code>https://api.allorigins.win/raw?url=</code>
+    <input id="proxy" type="text" placeholder="Tyhjä = suora fetch (useimmiten CORS estää)" />
+  </label>
+  <label>Ajallisen osuman kynnys (sekunteina):
+    <input id="threshold" type="number" value="5" min="0" />
+  </label>
+  <button id="run">Hae rastikoodit</button>
+  <div id="status"></div>
+  <div id="result"></div>
+
+<script>
+async function fetchHtml(url, proxy){
+  const target = proxy ? proxy + encodeURIComponent(url) : url;
+  const res = await fetch(target);
+  if(!res.ok) throw new Error('HTTP ' + res.status + ' for ' + target);
+  return await res.text();
+}
+
+function parseTimeToSeconds(t){
+  if(!t) return null;
+  t = t.trim();
+  if(!t) return null;
+  const parts = t.split(':').map(x=>parseInt(x,10));
+  if(parts.some(isNaN)) return null;
+  if(parts.length===3) return parts[0]*3600 + parts[1]*60 + parts[2];
+  if(parts.length===2) return parts[0]*60 + parts[1];
+  if(parts.length===1) return parts[0];
+  return null;
+}
+// Yksinkertainen taulukon lajittelija
+function makeTableSortable(table) {
+  const headers = table.querySelectorAll('th');
+  headers.forEach((th, colIndex) => {
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', () => {
+      const tbody = table.querySelector('tbody');
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const asc = !th.classList.contains('asc');
+      
+      // Nollataan luokat
+      headers.forEach(h => h.classList.remove('asc','desc'));
+      th.classList.add(asc ? 'asc' : 'desc');
+
+      rows.sort((a,b) => {
+        const aText = a.children[colIndex]?.textContent.trim() ?? '';
+        const bText = b.children[colIndex]?.textContent.trim() ?? '';
+
+        // Jos molemmat numeroita → vertaillaan numeroina
+        const aNum = parseFloat(aText.replace(',', '.'));
+        const bNum = parseFloat(bText.replace(',', '.'));
+        if(!isNaN(aNum) && !isNaN(bNum)) {
+          return asc ? aNum - bNum : bNum - aNum;
+        }
+
+        // Muuten merkkijonovertailu
+        return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+      });
+
+      rows.forEach(r => tbody.appendChild(r));
+    });
+  });
+}
+
+// Kutsutaan kun olet luonut tulostaulukon
+function enableSortingOnResult() {
+  const table = document.querySelector('#result table');
+  if(table) makeTableSortable(table);
+}
+
+function csvEscape(s){ if(s==null) return ''; return '"'+String(s).replace(/"/g,'""')+'"'; }
+
+document.getElementById('run').addEventListener('click', async ()=>{
+  const baseUrl = document.getElementById('baseUrl').value.trim();
+  const teamId = document.getElementById('teamId').value.trim();
+  const proxy = document.getElementById('proxy').value.trim();
+  const threshold = Number(document.getElementById('threshold').value);
+  const status = document.getElementById('status');
+  const result = document.getElementById('result');
+  status.textContent = '';
+  result.innerHTML = '';
+  
+  if(!baseUrl || !teamId){ status.innerHTML = '<p class="error">Täytä base URL ja team ID.</p>'; return; }
+
+  try{
+    status.textContent = 'Haetaan joukkueen sivua...';
+    const teamPageUrl = baseUrl.replace(/\/+$/,'') + '/' + encodeURIComponent(teamId) + '/';
+    const teamHtml = await fetchHtml(teamPageUrl, proxy);
+    status.textContent = 'Parsitaan joukkueen väliaikatiedot...';
+
+    const dom = new DOMParser().parseFromString(teamHtml, 'text/html');
+
+
+    // Poimitaan osuuksien vaihtoajat suoraan taulukon 4. sarakkeesta
+const teamTimeTexts = [];
+dom.querySelectorAll('tr.osuus').forEach(tr => {
+  const cells = tr.querySelectorAll('td.o');
+  if (cells.length >= 2) {
+    // "Result" löytyy tyypillisesti toisesta o-sarakkeesta (indeksi 1),
+    // mutta varminta on hakea neljäs td (Result-sarake)
+    const timeCell = tr.querySelectorAll('td')[3]; 
+    if (timeCell) {
+      const t = timeCell.textContent.trim();
+      if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) teamTimeTexts.push(t);
+    }
+  }
+});
+
+    const exchangeTimes = teamTimeTexts.map(parseTimeToSeconds);
+
+    // exchangeTimes[i] ~ hetki jolloin leg i päättyy => leg i+1 alkaa
+    // ensimmäisen osuuden lähtö on 0
+    const legStartOffsets = [0];
+    for(const t of exchangeTimes){ if(t!=null) legStartOffsets.push(t); }
+
+    // Poimitaan väliaikojen rivit
+// Haetaan kaikki väliaikarivit: niissä 2. solussa alkaa teksti "Intermediate"
+const intermediateRows = dom.querySelectorAll('tr td:nth-child(2)');
+
+const intermediates = Array.from(intermediateRows).map(td => {
+  const label = td.textContent.trim();
+  if (!/^Intermediate/i.test(label)) return null;
+
+  const row = td.parentElement;
+  const timeCell = row.querySelector('td:nth-child(4)');
+  if (!timeCell) return null;
+
+  const time = timeCell.textContent.trim();
+  const secs = parseTimeToSeconds(time);
+  if (secs == null) return null;
+
+  return { label, time, seconds: secs, raw: row.textContent.trim() };
+}).filter(Boolean);
+
+
+    status.textContent = 'Löytyi ' + intermediates.length + ' väliaikaa. Haetaan juoksijoiden leimaukset...';
+
+    // Juoksijoiden linkit
+    const runnerLinks = [];
+    dom.querySelectorAll('a').forEach(a=>{
+      const href = a.getAttribute('href') || '';
+      if(/\/kilpailijat\/.+\/[0-9]+\/?$/.test(href)){
+        let url = href;
+        if(url.startsWith('/')){
+          const base = (new URL(baseUrl)).origin;
+          url = base + url;
+        } else if(!/^https?:\/\//i.test(url)){
+          url = baseUrl.replace(/\/+$/,'') + '/' + url.replace(/^\/+/, '');
+        }
+        if(!runnerLinks.includes(url)) runnerLinks.push(url);
+      }
+    });
+
+    if(runnerLinks.length===0){
+      status.innerHTML = '<p class="error">Ei löytynyt juoksijan sivuja.</p>';
+      return;
+    }
+
+    status.textContent = 'Löytyi ' + runnerLinks.length + ' juoksijan sivua. Haetaan leimaukset...';
+
+    const allPunches = []; // {runnerIndex, code, secondsAbs}
+
+    for(let idx=0; idx<runnerLinks.length; idx++){
+      const rurl = runnerLinks[idx];
+      try{
+        const rhtml = await fetchHtml(rurl, proxy);
+        const rdom = new DOMParser().parseFromString(rhtml, 'text/html');
+        rdom.querySelectorAll('tr, li').forEach(tr=>{
+          const text = (tr.textContent||'').replace(/\s+/g,' ').trim();
+          const m = text.match(/\b(\d{1,4})\b[^\d\n\r]{0,15}(\d{1,2}:\d{2}:?\d{0,2})/);
+          if(m){
+            const code = m[1];
+            const timeStr = m[2];
+            const secs = parseTimeToSeconds(timeStr);
+            if(secs!=null){
+              const offset = legStartOffsets[idx] || 0;
+              const abs = secs + offset;
+              allPunches.push({runnerIndex:idx+1, code, timeStr, secondsAbs:abs, runnerUrl:rurl});
+            }
+          }
+        });
+      }catch(e){ console.warn('runner fetch failed', rurl, e); }
+    }
+
+    status.textContent = 'Yhteensä löydetty ' + allPunches.length + ' leimausta. Paritetaan väliaikoihin...';
+
+    const mapping = intermediates.map(inter => {
+  let best = null;
+  for(const p of allPunches){
+    const diff = Math.abs(p.secondsAbs - inter.seconds);
+    if(best===null || diff < best.diff){ best = {p, diff}; }
+  }
+
+  // Käytetään threshold-arvoa
+  if(best && best.diff > threshold) {
+    best = null; // liian suuri ero → ei match
+  }
+
+  return {intermediate: inter, match: best ? best.p : null, diff: best ? best.diff : null};
+});
+
+
+    let html = '<table><thead><tr><th>Väliaika</th><th>Aika</th><th>Rastikoodi</th><th>Osuus</th><th>Juoksija-sivu</th><th>ero (s)</th></tr></thead><tbody>';
+    for(const m of mapping){
+      html += '<tr>'+
+        '<td>'+ (m.intermediate.label||'') +'</td>'+
+        '<td>'+ (m.intermediate.time||'') +'</td>'+
+        '<td>'+ (m.match?m.match.code:'—') +'</td>'+
+        '<td>'+ (m.match?m.match.runnerIndex:'—') +'</td>'+
+        '<td>'+(m.match?('<a href="'+m.match.runnerUrl+'" target="_blank">link</a>'):'—')+'</td>'+
+        '<td>'+(m.diff!=null?m.diff:'—')+'</td>'+
+        '</tr>';
+    }
+    html += '</tbody></table>';
+
+    result.innerHTML = html;
+    // --- Uniikit leimakoodit JSONina ---
+const uniqueCodes = [...new Set(mapping.map(m => m.match ? m.match.code : null).filter(Boolean))];
+const jsonHtml = '<pre>'+JSON.stringify(uniqueCodes, null, 2)+'</pre>';
+result.innerHTML += '<h3>Uniikit väliaikaleimakoodit</h3>' + jsonHtml;
+
+    enableSortingOnResult();
+
+    const rows = [['label','time','code','runnerIndex','runnerUrl','diffSeconds']];
+    for(const m of mapping){ rows.push([m.intermediate.label, m.intermediate.time, m.match?m.match.code:'', m.match?m.match.runnerIndex:'', m.match?m.match.runnerUrl:'', m.diff!=null?m.diff:'']); }
+    const csv = rows.map(r=>r.map(csvEscape).join(',')).join('\n');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+   
+    status.innerHTML = '<p class="muted">Valmis. Käytetty logiikka huomioi osuuden lähtöhetken offsetin.</p>';
+
+  }catch(err){
+    status.innerHTML = '<p class="error">Virhe: '+ (err.message||err) +'</p>';
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
