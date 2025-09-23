@@ -62,6 +62,11 @@ Use cases include:
     mkdir data
     curl -o data/results_j${YEAR}_${TYPE}_iof.xml https://results.jukola.com/tulokset/results_j${YEAR}_${TYPE}_iof.xml
     ```
+    * fix the data. At least jukola relay 2025 contains wrong walues! 
+    ```bash
+    awk '/<StartTime>|<FinishTime>/ {match($0, />([^<]+)</, a); split(a[1], dt, "T"); split(dt[2], t, ":"); if(t[1]<23){ cmd="date -d \""a[1]" +1 day\" +%Y-%m-%dT%H:%M:%S"; cmd | getline new; close(cmd); gsub(a[1], new)} }1' results_j2025_ju_iof.xml > results_j2025_ju_iof_fixed.xml
+    ```
+
 
 
    * Example folder structure:
@@ -78,7 +83,7 @@ Use cases include:
    * Use the full path when running the simulator, e.g.:
 
      ```bash
-     python simulator.py --iof data/results_j2025_ve_iof.xml --speed 2
+     python simulator.py --iof data/results_j2025_ju_iof_fixed.xml --speed 2
      ```
 
 3. **Run the WebSocket server**

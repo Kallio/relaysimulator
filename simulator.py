@@ -25,6 +25,7 @@ def make_message(ev: Dict[str, Any]) -> str:
     return json.dumps(ev, separators=(',', ':')) + "\n"
 
 # --- IOF XML parsing (simple, adapt to your IOF flavour) ---
+
 def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
     tree = ET.parse(iof_path)
     root = tree.getroot()
@@ -39,26 +40,27 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
         if not members:
             continue
 
-        for idx, member in enumerate(members):
-            # yksilöllinen henkilö-ID ja nimi
+        for idx, member in enumerate(members,start=1):
+            # yritä löytää yksilöllinen henkilö-ID
             person_id = None
-            runner_name = None
             person_el = member.find('iof:Person', ns)
             if person_el is not None:
                 person_id = (
-                    person_el.findtext('iof:PersonID', namespaces=ns)
-                    or person_el.findtext('iof:Id', namespaces=ns)
-                    or person_el.findtext('iof:ID', namespaces=ns)
+                    person_el.findtext('iof:PersonID', namespaces=ns) or
+                    person_el.findtext('iof:Id', namespaces=ns) or
+                    person_el.findtext('iof:ID', namespaces=ns)
                 )
                 name_el = person_el.find('iof:Name', ns)
                 if name_el is not None:
                     given = name_el.findtext('iof:Given', namespaces=ns) or ""
                     family = name_el.findtext('iof:Family', namespaces=ns) or ""
                     runner_name = f"{given} {family}".strip()
+                else:
+                    runner_name = None
             else:
                 person_id = member.get('id') or member.get('MemberID') or None
+                runner_name = None
 
-            # fallback-ID
             if not person_id:
                 person_id = f"{team_bib or 'team'}:{idx}"
 
@@ -66,25 +68,18 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
             if result is None:
                 continue
 
+            # StartTime per leg
             start_time_txt = result.findtext('iof:StartTime', namespaces=ns)
+            # START: korjattu start_dt tz-aware ja päivämäärä huomioiden
+            start_dt = None
+            if start_time_txt:
+                start_dt = try_parse_time(start_time_txt)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            # END
+
             status_txt = result.findtext('iof:Status', namespaces=ns)
-            start_dt = try_parse_time(start_time_txt) if start_time_txt else None
 
-            # --- aina luodaan start-event, vaikka ei yhtään splittiä löytyisi ---
-            if start_dt:
-                events.append({
-                    'timestamp': start_dt.isoformat(),
-                    'runner_id': person_id,
-                    'runner_name': runner_name,
-                    'team_id': team_bib,
-                    'device_id': 'start',
-                    'device_type': 'login',
-                    'raw_time': start_time_txt,
-                    'status': status_txt or 'OK',
-                    'event': 'start'
-                })
-
-            # käsitellään kaikki väliajat
             for split in result.findall('iof:SplitTime', ns):
                 code = split.findtext('iof:ControlCode', namespaces=ns)
                 time_txt = split.findtext('iof:Time', namespaces=ns)
@@ -92,12 +87,23 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
                     continue
 
                 ts = None
-                if ":" in time_txt and len(time_txt.split(":")) == 3:
-                    hh, mm, ss = map(int, time_txt.split(":"))
-                    ts = start_dt.replace(hour=hh, minute=mm, second=ss) if start_dt else None
-                else:
-                    offset = int(time_txt)
-                    ts = start_dt + timedelta(seconds=offset) if start_dt else None
+                # Käytä aina StartTime + offset
+                if start_dt:
+                    ts = None
+                    try:
+                        # offset sekunneissa
+                        offset = int(time_txt)
+                        ts = start_dt + timedelta(seconds=offset)
+                    except ValueError:
+                        # jos hh:mm:ss-formaatti
+                        try:
+                            hh, mm, ss = map(int, time_txt.split(":"))
+                            # laske seconds offset suhteessa start_dt:n kellonaikaan
+                            delta_sec = (hh*3600 + mm*60 + ss) - (start_dt.hour*3600 + start_dt.minute*60 + start_dt.second)
+                            ts = start_dt + timedelta(seconds=delta_sec)
+                        except Exception:
+                            ts = start_dt
+
 
                 if ts:
                     events.append({
