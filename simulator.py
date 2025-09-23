@@ -6,9 +6,18 @@ import xml.etree.ElementTree as ET
 import json 
 import random
 import aiohttp
+import websockets
 import os
+
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Tuple
+
+# --- Predefined login devices ---
+LOGIN_DEVICES     = [f"login_{i}" for i in range(1, 11)]    # 10 logins
+DUMP_DEVICES      = [f"dump_{i}" for i in range(1, 6)]      # 5 tulosten purku
+ITKUMUURI_DEVICES = [f"itkumuuri_{i}" for i in range(1, 4)] # 3 itkumuuri
+
+
 
 # --- Configurable message format helpers ---
 def make_message(ev: Dict[str, Any]) -> str:
@@ -126,73 +135,95 @@ class DeviceClient:
         self.device_id = device_id
         self.host = host
         self.port = port
-        self.writer = None
+        self.ws = None
 
     async def connect(self):
         try:
-            reader, writer = await asyncio.open_connection(self.host, self.port)
-            self.writer = writer
-            print(f"[{self.device_id}] connected to {self.host}:{self.port}")
+            self.ws = await websockets.connect(f"ws://{self.host}:{self.port}/sim")
+            print(f"[{self.device_id}] connected to ws://{self.host}:{self.port}/sim")
         except Exception as e:
             print(f"[{self.device_id}] connect error: {e}")
-            self.writer = None
+            self.ws = None
 
     async def send(self, message: str):
-        # Konsoliloki: näytä mitä lähetetään
         print(f"[{self.device_id}] sending: {message.strip()}")
-        if not self.writer:
+        if not self.ws:
             await self.connect()
-            if not self.writer:
-          #      print(f"[{self.device_id}] cannot send, no connection")
+            if not self.ws:
                 return
         try:
-            self.writer.write(message.encode('utf-8'))
-            await self.writer.drain()
-           # print(f"[{self.device_id}] sent OK")
+            await self.ws.send(message)
         except Exception as e:
-           # print(f"[{self.device_id}] send error: {e}")
+            print(f"[{self.device_id}] send error: {e}")
             try:
-                self.writer.close()
+                await self.ws.close()
             except Exception:
                 pass
-            self.writer = None
+            self.ws = None
 
     async def close(self):
-        if self.writer:
+        if self.ws:
             try:
-                self.writer.close()
-                await self.writer.wait_closed()
-         #       print(f"[{self.device_id}] connection closed")
+                await self.ws.close()
+                print(f"[{self.device_id}] connection closed")
             except Exception:
                 pass
-            self.writer = None
+            self.ws = None
+
 async def load_allowed_controls(file_path: str = None, url: str = None) -> set:
     controls = set()
+
+    # Lue paikallinen tiedosto (JSON-lista odotettuna)
     if file_path and os.path.exists(file_path):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                for ln in f:
-                    code = ln.strip()
-                    if code:
-                        controls.add(code.lower())
+                text = f.read()
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, list):
+                        for item in data:
+                            if item is not None:
+                                controls.add(str(item).strip().lower())
+                    else:
+                        print(f"Warning: controls file {file_path} does not contain a JSON list")
+                except json.JSONDecodeError:
+                    # Fallback: rivikohtainen lista (kuten alkuperäisessä)
+                    f.seek(0)
+                    for ln in f:
+                        code = ln.strip()
+                        if code:
+                            controls.add(code.lower())
         except Exception as e:
             print(f"Warning: could not read controls file {file_path}: {e}")
+
+    # Hae URLista (odotetaan JSON-listaa) # tämä tulis varmaan suoraa navisportista
     if url:
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, timeout=10) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            text = await resp.text()
+                            try:
+                                data = json.loads(text)
+                            except Exception:
+                                data = None
                         if isinstance(data, list):
                             for item in data:
-                                controls.add(str(item).strip().lower())
+                                if item is not None:
+                                    controls.add(str(item).strip().lower())
                         else:
                             print(f"Warning: controls URL did not return a JSON list")
                     else:
                         print(f"Warning: controls URL returned status {resp.status}")
         except Exception as e:
             print(f"Warning: could not fetch controls from {url}: {e}")
+
     return controls
+
+
 
 def normalize(c):
     return None if c is None else str(c).strip().lower()
@@ -203,9 +234,18 @@ def control_allowed(control, allowed_controls:set):
     nc = normalize(control)
     return nc in allowed_controls
 
-async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed: float, one_conn_per_device: bool, allowed_controls:set):
+async def run_simulator(events: List[Dict[str,Any]],
+                        host: str,
+                        port: int,
+                        speed: float,
+                        one_conn_per_device: bool,
+                        allowed_controls:set):
+
+
     device_clients: Dict[str, DeviceClient] = {}
     all_timeline: List[Tuple[datetime, Dict[str,Any]]] = []
+
+    # prepare timeline
     for ev in events:
         ts = datetime.fromisoformat(ev['timestamp'])
         all_timeline.append((ts, ev))
@@ -213,7 +253,7 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
         print("No events found.")
         return
 
-    # Kaikki punchit per juoksija (dump)
+    # organize punches per runner
     all_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
     for ts, ev in all_timeline:
         if ev.get('event') != 'punch':
@@ -221,8 +261,11 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
         runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
         all_by_runner.setdefault(runner, []).append((ts, ev))
 
-    # Julkaistavat punchit per juoksija (suodatettu)
+    # published punches (filtered by allowed_controls)
     published_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
+    for runner, punches in all_by_runner.items():
+    # varmista että runner on dictionaryssä heti
+        published_by_runner.setdefault(runner, [])
     for ts, ev in all_timeline:
         if ev.get('event') != 'punch':
             continue
@@ -230,28 +273,29 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
             runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
             published_by_runner.setdefault(runner, []).append((ts, ev))
 
-    # Jos allowed_controls annettu mutta ei yksikään punch osunut: fallback -> julkaise kaikki
+    # fallback: if allowed_controls provided but none matched
     if allowed_controls and not any(published_by_runner.values()):
         print("No punches matched allowed controls — falling back to publishing ALL punches")
         published_by_runner = dict(all_by_runner)
 
-    # Luo extra events: login perustuen published_by_runner (jos julkaistavia ei ole, käytä all_by_runner)
+    # --- extra events: login, dump, itkumuuri ---
     extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
-    runners = set(all_by_runner.keys())
-    for runner in runners:
-        evs_for_login = published_by_runner.get(runner) or all_by_runner.get(runner) or []
-        if not evs_for_login:
+    for runner in all_by_runner.keys():
+        evs_for_runner = published_by_runner.get(runner) or all_by_runner.get(runner)
+        if not evs_for_runner:
             continue
-        evs_sorted = sorted(evs_for_login, key=lambda x: x[0])
+        evs_sorted = sorted(evs_for_runner, key=lambda x: x[0])
         first_ts = evs_sorted[0][0]
         last_ts = evs_sorted[-1][0]
 
+        # login
         minutes_before = random.randint(14, 60)
         login_ts = first_ts - timedelta(minutes=minutes_before)
+        
         login_event = {
             'timestamp': login_ts.isoformat(),
             'runner_id': runner,
-            'device_id': f"login_{runner}",
+            'device_id': random.choice(LOGIN_DEVICES),
             'device_type': 'login',
             'event': 'login',
             'raw_time': None,
@@ -260,10 +304,9 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
         }
         extra_events.append((login_ts, login_event))
 
+        # dump
         minutes_after = random.randint(10, 15)
         dump_ts = last_ts + timedelta(minutes=minutes_after)
-        
-        # Käytä ALL punches (all_by_runner) dumpissa
         punches = []
         for t, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
             punches.append({
@@ -272,33 +315,31 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
                 'status': e.get('status'),
                 'device_type': e.get('device_type')
             })
-
         dump_event = {
             'timestamp': dump_ts.isoformat(),
             'runner_id': runner,
-            'device_id': f"dump_{runner}",
+            'device_id': random.choice(DUMP_DEVICES),
             'device_type': 'results_dump',
             'event': 'results_dump',
+            'dump_time': dump_ts.isoformat(),
             'punches': punches,
             'note': f'dump {minutes_after}min after last punch'
         }
         extra_events.append((dump_ts, dump_event))
 
-        # --- NEW: itkumuuri event ---
+        # itkumuuri
         runner_status = None
-        # look at the last punch for this runner (they all carry status)
         for _, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
             if e.get('status'):
                 runner_status = e['status']
                 break
-
         if runner_status and runner_status not in ("OK", "Finished"):
             itkumuuri_delay = random.randint(5, 60)
             itkumuuri_ts = dump_ts + timedelta(minutes=itkumuuri_delay)
             itkumuuri_event = {
                 'timestamp': itkumuuri_ts.isoformat(),
                 'runner_id': runner,
-                'device_id': f"itkumuuri_{runner}",
+                'device_id': random.choice(ITKUMUURI_DEVICES),
                 'device_type': 'itkumuuri',
                 'event': 'itkumuuri',
                 'status': runner_status,
@@ -306,59 +347,38 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
             }
             extra_events.append((itkumuuri_ts, itkumuuri_event))
 
-    # Published timeline: yhdistä published_by_runner tapahtumat (yksittäiset lähetykset)
-    published_timeline: List[Tuple[datetime, Dict[str,Any]]] = []
-    for evs in published_by_runner.values():
-        published_timeline.extend(evs)
-
-    combined = extra_events + published_timeline
+    # combine and sort all events
+    combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
     combined.sort(key=lambda x: x[0])
 
-    # Shift so first event is now
+    # shift all events to now
     base_time = combined[0][0]
     now = datetime.now(timezone.utc)
     shift = now - base_time
 
     tasks = []
     for ts, ev in combined:
-        shifted_ts = (ts + shift).astimezone()
         delay = (ts - base_time).total_seconds() / speed
-
-        short_runner = ev.get('runner_id') or ev.get('runner_name') or '-'
-        short_control = ev.get('device_id') or ev.get('raw_control') or ev.get('device_type') or '-'
-        ev_type = ev.get('event') or ev.get('device_type') or '-'
+        shifted_ts = (ts + shift).astimezone()
+        short_runner = ev.get('runner_id') or '-'
+        short_control = ev.get('device_id') or ev.get('device_type') or '-'
+        ev_type = ev.get('event') or '-'
         print(f"{shifted_ts.strftime('%Y-%m-%d %H:%M:%S')} | +{delay:5.1f}s | {ev_type} | r={short_runner} c={short_control}")
 
         async def schedule_and_send(delay_sec, event, original_ts):
             await asyncio.sleep(max(0.0, delay_sec))
             device_id = event.get('device_id') or f"dev_{event.get('device_type')}"
-            if one_conn_per_device:
-                key = device_id
-            else:
-                key = f"{device_id}_{int(datetime.now(timezone.utc).timestamp()*1000)%1000000}"
+            key = device_id if one_conn_per_device else f"{device_id}_{int(datetime.now(timezone.utc).timestamp()*1000)%1000000}"
             if key not in device_clients:
                 device_clients[key] = DeviceClient(key, host, port)
 
             sent_ts = (original_ts + shift).isoformat()
+
+            # build message
+            msg_obj = {'device_id': key, 'device_type': event.get('device_type'), 'runner_id': event.get('runner_id'),
+                       'event': event.get('event'), 'timestamp': sent_ts}
             if event.get('event') == 'login':
-                msg_obj = {
-                    'device_id': key,
-                    'device_type': 'login',
-                    'runner_id': event.get('runner_id'),
-                    'event': 'login',
-                    'login_time': sent_ts,
-                    'note': event.get('note'),
-                }
-            elif event.get('event') == 'itkumuuri':
-                msg_obj = {
-                    'device_id': key,
-                    'device_type': 'itkumuuri',
-                    'runner_id': event.get('runner_id'),
-                    'event': 'itkumuuri',
-                    'status': event.get('status'),
-                    'note': event.get('note'),
-                    'timestamp': sent_ts
-                }
+                msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
             elif event.get('event') == 'results_dump':
                 shifted_punches = []
                 for p in event.get('punches', []):
@@ -367,36 +387,14 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
                         shifted_p = (orig_p_dt + shift).isoformat()
                     except Exception:
                         shifted_p = p.get('time')
-                    shifted_punches.append({
-                        'control': p.get('control'),
-                        'time': shifted_p,
-                        'status': p.get('status'),
-                        'device_type': p.get('device_type')
-                    })
-                msg_obj = {
-                    'device_id': key,
-                    'device_type': 'results_dump',
-                    'runner_id': event.get('runner_id'),
-                    'event': 'results_dump',
-                    'dump_time': sent_ts,
-                    'punches': shifted_punches,
-                    'note': event.get('note'),
-                }
-            else:
-                msg_obj = {
-                    'device_id': key,
-                    'device_type': event.get('device_type'),
-                    'runner_id': event.get('runner_id'),
-                    'event': event.get('event'),
-                    'raw_control': event.get('device_id'),
-                    'status': event.get('status'),
-                    'timestamp': sent_ts
-                }
-                
+                    shifted_punches.append({**p, 'time': shifted_p})
+                msg_obj.update({'dump_time': sent_ts, 'punches': shifted_punches, 'note': event.get('note')})
+            elif event.get('event') == 'itkumuuri':
+                msg_obj.update({'status': event.get('status'), 'note': event.get('note')})
 
             msg = make_message(msg_obj)
             await device_clients[key].send(msg)
-                    
+
         tasks.append(asyncio.create_task(schedule_and_send(delay, ev, ts)))
 
     await asyncio.gather(*tasks)
@@ -404,16 +402,18 @@ async def run_simulator(events: List[Dict[str,Any]], host: str, port: int, speed
 
 
 # --- CLI ---
+
 def main():
     p = argparse.ArgumentParser(description="IOF3 -> TCP simulator")
     p.add_argument('--iof', required=True, help='path to iof3.xml')
     p.add_argument('--host', default='127.0.0.1')
-    p.add_argument('--port', type=int, default=9000)
+    p.add_argument('--port', type=int, default=8080)
     p.add_argument('--controls-file', help='Path to file with allowed control codes, one per line')
     p.add_argument('--controls-url', help='URL returning JSON array of allowed control codes')
     p.add_argument('--speed', type=float, default=1.0, help='1.0 realtime, 2.0 twice as fast')
-    p.add_argument('--one-conn-per-device', action='store_true',
-                   help='If set, use one TCP connection per device id (default: create unique client per event)')
+    p.add_argument('--one-conn-per-device', action='store_true', help='If set, use one TCP connection per device id (default: create unique client per event)')
+    p.add_argument('--start-offset', type=float, default=0.0, help='Start offset in hours to skip from beginning of simulation (default 0)')
+
     args = p.parse_args()
 
     events = parse_iof3_events(args.iof)
@@ -427,6 +427,8 @@ def main():
         print("No controls list provided or failed to load — publishing ALL punches")
 
     asyncio.run(run_simulator(events, args.host, args.port, args.speed, args.one_conn_per_device, allowed_controls))
+
+
 
 if __name__ == '__main__':
     main()
