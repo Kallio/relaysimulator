@@ -64,7 +64,7 @@ Use cases include:
     ```
     * fix the data. At least jukola relay 2025 contains wrong walues! 
     ```bash
-    awk '/<StartTime>|<FinishTime>/ {match($0, />([^<]+)</, a); split(a[1], dt, "T"); split(dt[2], t, ":"); if(t[1]<23){ cmd="date -d \""a[1]" +1 day\" +%Y-%m-%dT%H:%M:%S"; cmd | getline new; close(cmd); gsub(a[1], new)} }1' results_j2025_ju_iof.xml > results_j2025_ju_iof_fixed.xml
+    python fix_jukola_xml_date_values.py results_j2025_ju_iof.xml > results_j2025_ju_iof_fixed.xml
     ```
 
 
@@ -79,6 +79,7 @@ Use cases include:
      └─ data/
          ├─ results_j2025_ve_iof.xml
          └─ results_j2025_ju_iof.xml
+         └─ results_j2025_ju_iof_fixed.xml 
      ```
    * Use the full path when running the simulator, e.g.:
 
