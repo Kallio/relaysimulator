@@ -6,21 +6,25 @@
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
     body { font-family: sans-serif; margin: 0; padding: 0; }
-    #plot { width: 100vw; height: 100vh; }
+    #plot { width: 100vw; height: 90vh; }
+    #controls { width: 100vw; height: 10vh; padding: 10px; }
+    button { font-size: 16px; padding: 5px 15px; }
   </style>
 </head>
 <body>
   <div id="plot"></div>
+  <div id="controls">
+    <button id="resetBtn">Reset Plot</button>
+  </div>
   <script>
     const ws = new WebSocket(`ws://${location.host}/ws`);
-    const controls = [];
-    const eventHistory = [];
+    let controls = [];
+    let eventHistory = [];
 
-    // osuus -> trace ja värit
-    const legTraces = {};
-    const legColors = {};
-    const colorPalette = Plotly.d3.scale.category10(); // 10 eri väriä
-    const drawnMassStarts = new Set(); // vältetään duplicate-viivat
+    let legTraces = {};
+    let legColors = {};
+    const colorPalette = Plotly.d3.scale.category10();
+    const drawnMassStarts = new Set();
 
     function getLegFromRunner(runnerId) {
       if (!runnerId) return "unknown";
@@ -49,18 +53,52 @@
       return legTraces[leg];
     }
 
-    // initial empty plot
-    Plotly.newPlot('plot', [], {
-      title: "Leimaukset osuuksittain",
-      xaxis: { title: "Aika" },
-      yaxis: { title: "Rastit", type: "category", categoryorder: "array", categoryarray: controls },
-      legend: { orientation: "h" }
-    });
+    function sortControls(arr) {
+      // Categorize controls
+      const login = [];
+      const mass = [];
+      const dump = [];
+      const itk = [];
+      const others = [];
+
+      arr.forEach(c => {
+        const lc = (c || '').toString();
+        if (lc.startsWith('login_')) login.push(c);
+        else if (lc === 'mass_start' || lc.startsWith('mass_start')) mass.push(c);
+        else if (lc.startsWith('dump_')) dump.push(c);
+        else if (lc.startsWith('itkumuuri_')) itk.push(c);
+        else others.push(c);
+      });
+
+      // Keep original relative order within each group
+      return [...login, ...mass, ...others, ...dump, ...itk];
+    }
+
+    function resetPlot() {
+      controls = [];
+      eventHistory = [];
+      legTraces = {};
+      legColors = {};
+      drawnMassStarts.clear();
+
+      Plotly.newPlot('plot', [], {
+        title: "Leimaukset osuuksittain",
+        xaxis: { title: "Aika" },
+        yaxis: { title: "Rastit", type: "category", categoryorder: "array", categoryarray: [] },
+        legend: { orientation: "h" }
+      });
+    }
+
+
+    document.getElementById('resetBtn').addEventListener('click', resetPlot);
+
+    // --- Initial empty plot ---
+    resetPlot();
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
 
-      // --- Mass-start event ---
+      // Mass-start
       if (msg.type === 'mass_start' && msg.timestamp && !drawnMassStarts.has(msg.timestamp)) {
         const startTs = new Date(msg.timestamp);
         Plotly.addTraces('plot', {
@@ -73,7 +111,7 @@
         drawnMassStarts.add(msg.timestamp);
       }
 
-      // --- Normaalit leimaukset ---
+      // Normal punches
       if (msg.type === 'update' && msg.stats.last) {
         const ev = msg.stats.last;
         const runner = ev.runner_id || "unknown";
@@ -82,12 +120,14 @@
 
         eventHistory.push({ ts, control, runner });
 
-        if (!controls.includes(control)) {
+              if (!controls.includes(control)) {
           controls.push(control);
-          Plotly.relayout('plot', { 'yaxis.categoryarray': controls });
+          const sorted = sortControls(controls);
+          // preserve controls as inserted but set sorted order for plotting
+          Plotly.relayout('plot', { 'yaxis.categoryarray': sorted });
         }
 
-        // punches ±5 min
+
         const windowStart = new Date(ts.getTime() - 5*60000);
         const windowEnd   = new Date(ts.getTime() + 5*60000);
         const punchesNearby = eventHistory.filter(e =>

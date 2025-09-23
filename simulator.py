@@ -117,8 +117,8 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
 
 
 def try_parse_time(t: str) -> datetime:
-    # Yritetään useita formaatteja; lisää tarvittaessa
-    fmts = ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%H:%M:%S"]
+    # Yritetään useita formaatteja; lisää tarvittaessa 2025-06-14T23:00:00+03:00
+    fmts = ["%Y-%m-%dT%H:%M:%S%z"]
     for f in fmts:
         try:
             dt = datetime.strptime(t, f)
@@ -137,6 +137,8 @@ def guess_device_type(control: str, status: str) -> str:
     c = control.lower()
     if 'start' in c or c.startswith('s'):
         return 'login'
+    if 'mass_start ' in c :
+        return 'mass_start'
     if 'finish' in c or 'maali' in c or 'f' == c:
         return 'finish'
     if 'exchange' in c or 'vaihto' in c:
@@ -155,13 +157,15 @@ class DeviceClient:
     async def connect(self):
         try:
             self.ws = await websockets.connect(f"ws://{self.host}:{self.port}/sim")
-            print(f"[{self.device_id}] connected to ws://{self.host}:{self.port}/sim")
+            print(f"[{self.device_id}] c.")
         except Exception as e:
             print(f"[{self.device_id}] connect error: {e}")
             self.ws = None
 
     async def send(self, message: str):
-        print(f"[{self.device_id}] sending: {message.strip()}")
+        #print(f"[{self.device_id}] sending: {message.strip()}")
+        # strip out extra data
+        print(f"[{self.device_id}] s.", end='')
         if not self.ws:
             await self.connect()
             if not self.ws:
@@ -275,38 +279,36 @@ async def run_simulator(events: List[Dict[str,Any]],
         runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
         all_by_runner.setdefault(runner, []).append((ts, ev))
 
+      #  print(f"Total runners before counter: {len(all_by_runner)}")
+
     # alusta published_by_runner kaikille heti, vaikka ei olisi yhtään allowed punchia
     published_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
     for runner, punches in all_by_runner.items():
         published_by_runner[runner] = list(punches)
 
-    # --- check for mass start ---
-    from collections import Counter
-    
-    # kerätään kaikki ensimmäiset start-times jokaiselle runnerille
-    first_start_times = []
-    for runner, evs in all_by_runner.items():
-        sorted_evs = sorted(evs, key=lambda x: x[0])
-        first_start_times.append(sorted_evs[0][0])
-    
-    # lasketaan, kuinka monta juoksijaa starttaa samanaikaisesti
-    ts_counter = Counter(first_start_times)
-    for ts, count in ts_counter.items():
-        if count >= 300:
-            # lisää startline-event
-            startline_event = {
-                'timestamp': ts.isoformat(),
-                'runner_id': 'mass_start',
-                'device_id': 'startline_mass',
-                'device_type': 'startline',
-                'event': 'startline',
-                'note': f'Mass start with {count} runners'
-            }
-            extra_events.append((ts, startline_event))
-            print(f"Mass startline event added at {ts} for {count} runners")
+    extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
+    start_strings = [
+    "2025-06-14T23:00:00+03:00",
+    "2025-06-15T09:30:00+03:00",
+    "2025-06-15T09:45:00+03:00"
+]
+    extra_events = []
+
+    for s in start_strings:
+        ts = datetime.fromisoformat(s)          # timezone-aware datetime
+        event = {
+            'timestamp': ts.isoformat(),
+            'runner_id': 'mass_start',
+            'device_id': 'mass_start',
+            'device_type': 'mass_start',
+            'event': 'mass_start',
+            'note': 'Mass start at known time'
+        }
+        extra_events.append((ts, event))
+        print(f"Mass startline event added at {ts.isoformat()}")
 
     # --- extra events: login, dump, itkumuuri ---
-    extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
+    #extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
     for runner, punches in all_by_runner.items():
         if not punches:
             continue
@@ -451,7 +453,7 @@ def main():
     args = p.parse_args()
 
     events = parse_iof3_events(args.iof)
-    print(f"Parsed {len(events)} events. Speed={args.speed} Host={args.host}:{args.port}")
+#    print(f"Parsed {len(events)} events. Speed={args.speed} Host={args.host}:{args.port}")
 
     # load allowed controls (async)
     allowed_controls = asyncio.run(load_allowed_controls(args.controls_file, args.controls_url))
