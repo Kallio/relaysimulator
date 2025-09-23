@@ -40,26 +40,25 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
             continue
 
         for idx, member in enumerate(members):
-            # yritä löytää yksilöllinen henkilö-ID
+            # yksilöllinen henkilö-ID ja nimi
             person_id = None
-            # common IOF paths
+            runner_name = None
             person_el = member.find('iof:Person', ns)
             if person_el is not None:
-                person_id = person_el.findtext('iof:PersonID', namespaces=ns) or person_el.findtext('iof:Id', namespaces=ns) or person_el.findtext('iof:ID', namespaces=ns)
-                # jos nimi löytyy, käytä sitä myös runner_name
+                person_id = (
+                    person_el.findtext('iof:PersonID', namespaces=ns)
+                    or person_el.findtext('iof:Id', namespaces=ns)
+                    or person_el.findtext('iof:ID', namespaces=ns)
+                )
                 name_el = person_el.find('iof:Name', ns)
                 if name_el is not None:
                     given = name_el.findtext('iof:Given', namespaces=ns) or ""
                     family = name_el.findtext('iof:Family', namespaces=ns) or ""
                     runner_name = f"{given} {family}".strip()
-                else:
-                    runner_name = None
             else:
-                # joskus TeamMemberResult:ssä voi olla attribuutteja
                 person_id = member.get('id') or member.get('MemberID') or None
-                runner_name = None
 
-            # fallback: jos ei löydy, muodosta uniikki id team_bib:index
+            # fallback-ID
             if not person_id:
                 person_id = f"{team_bib or 'team'}:{idx}"
 
@@ -71,6 +70,21 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
             status_txt = result.findtext('iof:Status', namespaces=ns)
             start_dt = try_parse_time(start_time_txt) if start_time_txt else None
 
+            # --- aina luodaan start-event, vaikka ei yhtään splittiä löytyisi ---
+            if start_dt:
+                events.append({
+                    'timestamp': start_dt.isoformat(),
+                    'runner_id': person_id,
+                    'runner_name': runner_name,
+                    'team_id': team_bib,
+                    'device_id': 'start',
+                    'device_type': 'login',
+                    'raw_time': start_time_txt,
+                    'status': status_txt or 'OK',
+                    'event': 'start'
+                })
+
+            # käsitellään kaikki väliajat
             for split in result.findall('iof:SplitTime', ns):
                 code = split.findtext('iof:ControlCode', namespaces=ns)
                 time_txt = split.findtext('iof:Time', namespaces=ns)
@@ -100,6 +114,7 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
 
     events.sort(key=lambda e: e['timestamp'])
     return events
+
 
 def try_parse_time(t: str) -> datetime:
     # Yritetään useita formaatteja; lisää tarvittaessa
@@ -241,7 +256,6 @@ async def run_simulator(events: List[Dict[str,Any]],
                         one_conn_per_device: bool,
                         allowed_controls:set):
 
-
     device_clients: Dict[str, DeviceClient] = {}
     all_timeline: List[Tuple[datetime, Dict[str,Any]]] = []
 
@@ -253,7 +267,7 @@ async def run_simulator(events: List[Dict[str,Any]],
         print("No events found.")
         return
 
-    # organize punches per runner
+    # organize punches per runner (kaikki punchit mukaan heti)
     all_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
     for ts, ev in all_timeline:
         if ev.get('event') != 'punch':
@@ -261,37 +275,48 @@ async def run_simulator(events: List[Dict[str,Any]],
         runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
         all_by_runner.setdefault(runner, []).append((ts, ev))
 
-    # published punches (filtered by allowed_controls)
+    # alusta published_by_runner kaikille heti, vaikka ei olisi yhtään allowed punchia
     published_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
     for runner, punches in all_by_runner.items():
-    # varmista että runner on dictionaryssä heti
-        published_by_runner.setdefault(runner, [])
-    for ts, ev in all_timeline:
-        if ev.get('event') != 'punch':
-            continue
-        if control_allowed(ev.get('device_id'), allowed_controls):
-            runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
-            published_by_runner.setdefault(runner, []).append((ts, ev))
+        published_by_runner[runner] = list(punches)
 
-    # fallback: if allowed_controls provided but none matched
-    if allowed_controls and not any(published_by_runner.values()):
-        print("No punches matched allowed controls — falling back to publishing ALL punches")
-        published_by_runner = dict(all_by_runner)
+    # --- check for mass start ---
+    from collections import Counter
+    
+    # kerätään kaikki ensimmäiset start-times jokaiselle runnerille
+    first_start_times = []
+    for runner, evs in all_by_runner.items():
+        sorted_evs = sorted(evs, key=lambda x: x[0])
+        first_start_times.append(sorted_evs[0][0])
+    
+    # lasketaan, kuinka monta juoksijaa starttaa samanaikaisesti
+    ts_counter = Counter(first_start_times)
+    for ts, count in ts_counter.items():
+        if count >= 300:
+            # lisää startline-event
+            startline_event = {
+                'timestamp': ts.isoformat(),
+                'runner_id': 'mass_start',
+                'device_id': 'startline_mass',
+                'device_type': 'startline',
+                'event': 'startline',
+                'note': f'Mass start with {count} runners'
+            }
+            extra_events.append((ts, startline_event))
+            print(f"Mass startline event added at {ts} for {count} runners")
 
     # --- extra events: login, dump, itkumuuri ---
     extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
-    for runner in all_by_runner.keys():
-        evs_for_runner = published_by_runner.get(runner) or all_by_runner.get(runner)
-        if not evs_for_runner:
+    for runner, punches in all_by_runner.items():
+        if not punches:
             continue
-        evs_sorted = sorted(evs_for_runner, key=lambda x: x[0])
+        evs_sorted = sorted(punches, key=lambda x: x[0])
         first_ts = evs_sorted[0][0]
         last_ts = evs_sorted[-1][0]
 
         # login
         minutes_before = random.randint(14, 60)
         login_ts = first_ts - timedelta(minutes=minutes_before)
-        
         login_event = {
             'timestamp': login_ts.isoformat(),
             'runner_id': runner,
@@ -307,9 +332,9 @@ async def run_simulator(events: List[Dict[str,Any]],
         # dump
         minutes_after = random.randint(10, 15)
         dump_ts = last_ts + timedelta(minutes=minutes_after)
-        punches = []
-        for t, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
-            punches.append({
+        punches_dump = []
+        for t, e in evs_sorted:
+            punches_dump.append({
                 'control': e.get('device_id'),
                 'time': e.get('timestamp'),
                 'status': e.get('status'),
@@ -322,14 +347,14 @@ async def run_simulator(events: List[Dict[str,Any]],
             'device_type': 'results_dump',
             'event': 'results_dump',
             'dump_time': dump_ts.isoformat(),
-            'punches': punches,
+            'punches': punches_dump,
             'note': f'dump {minutes_after}min after last punch'
         }
         extra_events.append((dump_ts, dump_event))
 
-        # itkumuuri
+        # itkumuuri jos status ei ok
         runner_status = None
-        for _, e in sorted(all_by_runner.get(runner, []), key=lambda x: x[0]):
+        for _, e in evs_sorted:
             if e.get('status'):
                 runner_status = e['status']
                 break
@@ -347,11 +372,11 @@ async def run_simulator(events: List[Dict[str,Any]],
             }
             extra_events.append((itkumuuri_ts, itkumuuri_event))
 
-    # combine and sort all events
+    # yhdistetään kaikki eventit
     combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
     combined.sort(key=lambda x: x[0])
 
-    # shift all events to now
+    # shiftataan nykyhetkeen
     base_time = combined[0][0]
     now = datetime.now(timezone.utc)
     shift = now - base_time
@@ -366,6 +391,10 @@ async def run_simulator(events: List[Dict[str,Any]],
         print(f"{shifted_ts.strftime('%Y-%m-%d %H:%M:%S')} | +{delay:5.1f}s | {ev_type} | r={short_runner} c={short_control}")
 
         async def schedule_and_send(delay_sec, event, original_ts):
+            # allowed_controls-suodatus vasta tässä
+            if event.get('event') == 'punch' and not control_allowed(event.get('device_id'), allowed_controls):
+                return  # ohitetaan jos ei ole allowed
+
             await asyncio.sleep(max(0.0, delay_sec))
             device_id = event.get('device_id') or f"dev_{event.get('device_type')}"
             key = device_id if one_conn_per_device else f"{device_id}_{int(datetime.now(timezone.utc).timestamp()*1000)%1000000}"
@@ -375,8 +404,13 @@ async def run_simulator(events: List[Dict[str,Any]],
             sent_ts = (original_ts + shift).isoformat()
 
             # build message
-            msg_obj = {'device_id': key, 'device_type': event.get('device_type'), 'runner_id': event.get('runner_id'),
-                       'event': event.get('event'), 'timestamp': sent_ts}
+            msg_obj = {
+                'device_id': key,
+                'device_type': event.get('device_type'),
+                'runner_id': event.get('runner_id'),
+                'event': event.get('event'),
+                'timestamp': sent_ts
+            }
             if event.get('event') == 'login':
                 msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
             elif event.get('event') == 'results_dump':
