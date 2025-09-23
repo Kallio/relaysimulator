@@ -20,10 +20,10 @@
     const legTraces = {};
     const legColors = {};
     const colorPalette = Plotly.d3.scale.category10(); // 10 eri väriä
+    const drawnMassStarts = new Set(); // vältetään duplicate-viivat
 
     function getLegFromRunner(runnerId) {
       if (!runnerId) return "unknown";
-      // odotetaan muotoa esim. team:0, team:1
       const parts = runnerId.split(":");
       if (parts.length > 1 && !isNaN(parts[parts.length-1])) {
         return "Leg " + parts[parts.length-1];
@@ -59,6 +59,21 @@
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
+
+      // --- Mass-start event ---
+      if (msg.type === 'mass_start' && msg.timestamp && !drawnMassStarts.has(msg.timestamp)) {
+        const startTs = new Date(msg.timestamp);
+        Plotly.addTraces('plot', {
+          x: [startTs, startTs],
+          y: [0, 1],
+          mode: 'lines',
+          line: { color: 'red', width: 2, dash: 'dash' },
+          name: `Mass start ${msg.group || ''}`
+        });
+        drawnMassStarts.add(msg.timestamp);
+      }
+
+      // --- Normaalit leimaukset ---
       if (msg.type === 'update' && msg.stats.last) {
         const ev = msg.stats.last;
         const runner = ev.runner_id || "unknown";
@@ -81,7 +96,6 @@
         ).length;
 
         const leg = getLegFromRunner(runner);
-
         const tooltip = `Osuus: ${leg}<br>Runner: ${runner}<br>${control}<br>${ts.toISOString()}<br>Leimauksia ±5min: ${punchesNearby}`;
 
         const trace = getTraceForLeg(leg);
