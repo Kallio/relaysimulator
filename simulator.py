@@ -29,16 +29,20 @@ def make_message(ev: Dict[str, Any]) -> str:
 def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
     tree = ET.parse(iof_path)
     root = tree.getroot()
-    ns = {'iof': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
-
+    ns_uri = root.tag.split('}')[0].strip('{') if '}' in root.tag else None
+    ns = {'iof': ns_uri} if ns_uri else None
     events = []
 
     for team in root.findall('.//iof:TeamResult', ns):
         team_bib = team.findtext('iof:BibNumber', namespaces=ns) or team.get('bib') or team.get('id') or None
 
-        members = team.findall('.//iof:TeamMemberResult', ns)
+        if ns:
+            members = team.findall('.//iof:TeamMemberResult', ns)
+        else:
+            members = team.findall('.//TeamMemberResult')
         if not members:
             continue
+        
 
         for idx, member in enumerate(members,start=1):
             # yritä löytää yksilöllinen henkilö-ID
@@ -68,14 +72,18 @@ def parse_iof3_events(iof_path: str) -> List[Dict[str, Any]]:
             if result is None:
                 continue
 
-            # StartTime per leg
-            start_time_txt = result.findtext('iof:StartTime', namespaces=ns)
+            if ns:
+                start_time_txt = result.findtext('iof:StartTime', namespaces=ns)
+            else:
+                start_time_txt = result.findtext('StartTime')
+
             # START: korjattu start_dt tz-aware ja päivämäärä huomioiden
             start_dt = None
             if start_time_txt:
                 start_dt = try_parse_time(start_time_txt)
-            if start_dt.tzinfo is None:
+            if start_dt and start_dt.tzinfo is None:
                 start_dt = start_dt.replace(tzinfo=timezone.utc)
+
             # END
 
             status_txt = result.findtext('iof:Status', namespaces=ns)
