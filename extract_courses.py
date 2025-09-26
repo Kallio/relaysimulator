@@ -1,11 +1,29 @@
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
+def infer_leg_from_course_name(name):
+    """
+    Päätellään osuuden numero kurssin nimen perusteella.
+    Esim. J401 → leg 4, J302 → leg 3, J101 → leg 1
+    """
+    if not name or len(name) < 4:
+        return None
+    if name[0] in ('J', 'V') and name[1:4].isdigit():
+        return int(name[1])
+    return None
+
 def resultlist_to_coursedata(iof_in, courses_out):
     tree = ET.parse(iof_in)
     root = tree.getroot()
     ns_uri = root.tag.split('}')[0].strip('{')
     ns = {"iof": ns_uri}
+
+    # --- Hae classname ensimmäisestä ClassResult/Class/Name ---
+    classname_el = root.find(".//iof:ClassResult/iof:Class/iof:Name", ns)
+    if classname_el is None or not classname_el.text:
+        classname = "UnknownClass"
+    else:
+        classname = classname_el.text.strip()
 
     course_data = ET.Element("CourseData", {
         "xmlns": ns_uri,
@@ -20,7 +38,7 @@ def resultlist_to_coursedata(iof_in, courses_out):
 
     race_data = ET.SubElement(course_data, "RaceCourseData")
 
-    # --- kerää kaikki radat ja niiden rastit ---
+    # --- Kerää kaikki radat ja rastit ---
     courses = {}
     for tm in root.findall(".//iof:TeamMemberResult", ns):
         result = tm.find("iof:Result", ns)
@@ -31,23 +49,22 @@ def resultlist_to_coursedata(iof_in, courses_out):
             continue
         course_name = course_name_el.text.strip()
 
-        # kerätään rastit (SplitTime)
         splits = []
         for st in result.findall("iof:SplitTime", ns):
             code_el = st.find("iof:ControlCode", ns)
             if code_el is not None and code_el.text:
                 splits.append(code_el.text.strip())
 
-        # tallenna vain jos ei ole vielä lisätty
+        # Lisää radat dictionaryyn
         if course_name not in courses:
             courses[course_name] = splits
 
-    # --- luo Course-elementit ---
+    # --- Luo Course-elementit ---
     for name, controls in sorted(courses.items()):
         c = ET.SubElement(race_data, "Course")
         ET.SubElement(c, "Name").text = name
-        ET.SubElement(c, "CourseFamily").text = name
-        ET.SubElement(c, "Length").text = "0"  # ResultList ei sisällä pituutta luotettavasti
+        ET.SubElement(c, "CourseFamily").text = classname
+        ET.SubElement(c, "Length").text = "0"
         ET.SubElement(c, "Climb").text = "0"
 
         # Start
@@ -63,27 +80,17 @@ def resultlist_to_coursedata(iof_in, courses_out):
         cc_finish = ET.SubElement(c, "CourseControl", {"type": "Finish"})
         ET.SubElement(cc_finish, "Control").text = "F1"
 
-    # --- tee TeamCourseAssignment ---
-    for team in root.findall(".//iof:TeamResult", ns):
-        bib = team.find("iof:BibNumber", ns)
-        if bib is None or not bib.text:
-            continue
-        tca = ET.SubElement(race_data, "TeamCourseAssignment")
-        ET.SubElement(tca, "BibNumber").text = bib.text.strip()
+    # --- Luo ClassCourseAssignment per rata ---
+    for course_name in courses.keys():
+        leg = infer_leg_from_course_name(course_name)
+        if leg is not None:
+            cca = ET.SubElement(race_data, "ClassCourseAssignment", {"numberOfCompetitors": "0"})
+            ET.SubElement(cca, "ClassName").text = classname
+            ET.SubElement(cca, "CourseFamily").text = classname
+            ET.SubElement(cca, "AllowedOnLeg").text = str(leg)
+            ET.SubElement(cca, "CourseName").text = course_name
 
-        for tm in team.findall("iof:TeamMemberResult", ns):
-            result = tm.find("iof:Result", ns)
-            if result is None:
-                continue
-            leg = result.find("iof:Leg", ns)
-            course = result.find("iof:Course/iof:Name", ns)
-            if leg is not None and course is not None:
-                ass = ET.SubElement(tca, "TeamMemberCourseAssignment")
-                ET.SubElement(ass, "Leg").text = leg.text.strip()
-                ET.SubElement(ass, "CourseName").text = course.text.strip()
-                ET.SubElement(ass, "CourseFamily").text = course.text.strip()
-
-    # --- kirjoita tiedostoon ---
+    # --- Kirjoita tiedostoon ---
     tree_out = ET.ElementTree(course_data)
     tree_out.write(courses_out, encoding="UTF-8", xml_declaration=True)
     print(f"Kirjoitettu {courses_out}")
@@ -92,6 +99,6 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--iof", required=True, help="ResultList IOF XML")
-    p.add_argument("--out", required=True, help="Navisport CourseData.xml")
+    p.add_argument("--out", required=True, help="CourseData.xml output")
     args = p.parse_args()
     resultlist_to_coursedata(args.iof, args.out)
