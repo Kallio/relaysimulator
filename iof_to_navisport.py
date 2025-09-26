@@ -56,9 +56,9 @@ def iof_to_navisport(iof_path, out_csv, max_legs=None):
                     result = member.find('iof:Result', ns)
                     leg = result.findtext('iof:Leg', default='', namespaces=ns) if result is not None else str(i)
                     course = result.findtext('iof:Course/iof:Name', default='', namespaces=ns) if result is not None else ""
-
+                    card = f"{bib}{i}" if bib else str(i)
                     row.extend([
-                        name, "", "Kyllä", leg, "", course, ""  # kortti tyhjä, lähtöaika tyhjä
+                        name, card, "Kyllä", leg, "", course, ""  # kortti tyhjä, lähtöaika tyhjä
                     ])
                 else:
                     # Täytä tyhjillä
