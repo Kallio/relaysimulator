@@ -668,16 +668,18 @@ class BufferedSender:
 # --- CLI ---
 
 def main():
-    p = argparse.ArgumentParser(description="IOF3 -> TCP simulator")
-    p.add_argument('--iof', required=True, help='path to iof3.xml')
-    p.add_argument('--host', default='127.0.0.1')
-    p.add_argument('--port', type=int, default=8080)
-    p.add_argument('--controls-file', help='Path to file with allowed control codes, one per line')
-    p.add_argument('--controls-url', help='URL returning JSON array of allowed control codes')
-    p.add_argument('--speed', type=float, default=1.0, help='1.0 realtime, 2.0 twice as fast')
-    p.add_argument('--one-conn-per-device', action='store_true', help='If set, use one TCP connection per device id (default: create unique client per event)')
-    p.add_argument('--start-offset', type=float, default=0.0, help='Start offset in hours to skip from beginning of simulation (default 0)')
-    p.add_argument('--team-range', help='Bib numbers to simulate, e.g., "1,3,5,14-55"')
+    p = argparse.ArgumentParser(description="relay IOF3.xml -> relayreplay for simulating various aspects")
+    p.add_argument('-i', '--iof', required=True, help='path to iof3.xml')
+    p.add_argument('-H', '--host', default='127.0.0.1', help='server host')
+    p.add_argument('-P', '--port', type=int, default=8080, help='server port')
+    p.add_argument('-f', '--controls-file', help='Path to file with allowed control codes, one per line')
+    p.add_argument('-u', '--controls-url', help='URL returning JSON array of allowed control codes')
+    p.add_argument('-s', '--speed', type=float, default=1.0, help='1.0 realtime, 2.0 twice as fast')
+    p.add_argument('-o', '--one-conn-per-device', action='store_true', default=True,
+                   help='If set, use one TCP connection per device id (default: create unique client per event)')
+    p.add_argument('-t', '--start-offset', type=float, default=0.0,
+                   help='Start offset in hours to skip from beginning of simulation (default 0)')
+    p.add_argument('-r', '--team-range', help='Bib numbers to simulate, e.g., "1,3,5,14-55"')
 
     args = p.parse_args()
 
