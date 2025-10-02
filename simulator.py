@@ -284,190 +284,7 @@ def control_allowed(control, allowed_controls:set):
         return True
     nc = normalize(control)
     return nc in allowed_controls
-"""
-async def run_simulator(events: List[Dict[str,Any]],
-                        host: str,
-                        port: int,
-                        speed: float,
-                        one_conn_per_device: bool,
-                        allowed_controls:set):
 
-    device_clients: Dict[str, DeviceClient] = {}
-    all_timeline: List[Tuple[datetime, Dict[str,Any]]] = []
-
-    # prepare timeline
-    for ev in events:
-        ts = datetime.fromisoformat(ev['timestamp'])
-        all_timeline.append((ts, ev))
-    if not all_timeline:
-        print("No events found.")
-        return
-
-    # organize punches per runner (kaikki punchit mukaan heti)
-    all_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
-    for ts, ev in all_timeline:
-        if ev.get('event') != 'punch':
-            continue
-        runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
-        all_by_runner.setdefault(runner, []).append((ts, ev))
-
-      #  print(f"Total runners before counter: {len(all_by_runner)}")
-
-    # alusta published_by_runner kaikille heti, vaikka ei olisi yhtään allowed punchia
-    published_by_runner: Dict[str, List[Tuple[datetime, Dict[str,Any]]]] = {}
-    for runner, punches in all_by_runner.items():
-        published_by_runner[runner] = list(punches)
-
-    extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
-    start_strings = [
-    "2025-06-14T23:00:00+03:00",
-    "2025-06-15T09:30:00+03:00",
-    "2025-06-15T09:45:00+03:00"
-]
-    extra_events = []
-
-    for s in start_strings:
-        ts = datetime.fromisoformat(s)          # timezone-aware datetime
-        event = {
-            'timestamp': ts.isoformat(),
-            'runner_id': 'mass_start',
-            'device_id': 'mass_start',
-            'device_type': 'mass_start',
-            'event': 'mass_start',
-            'note': 'Mass start at known time'
-        }
-        extra_events.append((ts, event))
-        print(f"Mass startline event added at {ts.isoformat()}")
-
-    # --- extra events: login, dump, itkumuuri ---
-    #extra_events: List[Tuple[datetime, Dict[str,Any]]] = []
-    for runner, punches in all_by_runner.items():
-        if not punches:
-            continue
-        evs_sorted = sorted(punches, key=lambda x: x[0])
-        first_ts = evs_sorted[0][0]
-        last_ts = evs_sorted[-1][0]
-
-        # login
-        minutes_before = random.randint(14, 60)
-        login_ts = first_ts - timedelta(minutes=minutes_before)
-        login_event = {
-            'timestamp': login_ts.isoformat(),
-            'runner_id': runner,
-            'device_id': random.choice(LOGIN_DEVICES),
-            'device_type': 'login',
-            'event': 'login',
-            'raw_time': None,
-            'status': 'ok',
-            'note': f'login {minutes_before}min before first punch'
-        }
-        extra_events.append((login_ts, login_event))
-
-        # dump
-        minutes_after = random.randint(10, 15)
-        dump_ts = last_ts + timedelta(minutes=minutes_after)
-        punches_dump = []
-        for t, e in evs_sorted:
-            punches_dump.append({
-                'control': e.get('device_id'),
-                'time': e.get('timestamp'),
-                'status': e.get('status'),
-                'device_type': e.get('device_type')
-            })
-        dump_event = {
-            'timestamp': dump_ts.isoformat(),
-            'runner_id': runner,
-            'device_id': random.choice(DUMP_DEVICES),
-            'device_type': 'results_dump',
-            'event': 'results_dump',
-            'dump_time': dump_ts.isoformat(),
-            'punches': punches_dump,
-            'note': f'dump {minutes_after}min after last punch'
-        }
-        extra_events.append((dump_ts, dump_event))
-
-        # itkumuuri jos status ei ok
-        runner_status = None
-        for _, e in evs_sorted:
-            if e.get('status'):
-                runner_status = e['status']
-                break
-        if runner_status and runner_status not in ("OK", "Finished"):
-            itkumuuri_delay = random.randint(5, 60)
-            itkumuuri_ts = dump_ts + timedelta(minutes=itkumuuri_delay)
-            itkumuuri_event = {
-                'timestamp': itkumuuri_ts.isoformat(),
-                'runner_id': runner,
-                'device_id': random.choice(ITKUMUURI_DEVICES),
-                'device_type': 'itkumuuri',
-                'event': 'itkumuuri',
-                'status': runner_status,
-                'note': f'itkumuuri {itkumuuri_delay}min after dump (status={runner_status})'
-            }
-            extra_events.append((itkumuuri_ts, itkumuuri_event))
-
-    # yhdistetään kaikki eventit
-    combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
-    combined.sort(key=lambda x: x[0])
-
-    # shiftataan nykyhetkeen
-    base_time = combined[0][0]
-    now = datetime.now(timezone.utc)
-    shift = now - base_time
-
-    tasks = []
-    for ts, ev in combined:
-        delay = (ts - base_time).total_seconds() / speed
-        shifted_ts = (ts + shift).astimezone()
-        short_runner = ev.get('runner_id') or '-'
-        short_control = ev.get('device_id') or ev.get('device_type') or '-'
-        ev_type = ev.get('event') or '-'
-        print(f"{shifted_ts.strftime('%Y-%m-%d %H:%M:%S')} | +{delay:5.1f}s | {ev_type} | r={short_runner} c={short_control}")
-
-        async def schedule_and_send(delay_sec, event, original_ts):
-            # allowed_controls-suodatus vasta tässä
-            if event.get('event') == 'punch' and not control_allowed(event.get('device_id'), allowed_controls):
-                return  # ohitetaan jos ei ole allowed
-
-            await asyncio.sleep(max(0.0, delay_sec))
-            device_id = event.get('device_id') or f"dev_{event.get('device_type')}"
-            key = device_id if one_conn_per_device else f"{device_id}_{int(datetime.now(timezone.utc).timestamp()*1000)%1000000}"
-            if key not in device_clients:
-                device_clients[key] = DeviceClient(key, host, port)
-
-            sent_ts = (original_ts + shift).isoformat()
-
-            # build message
-            msg_obj = {
-                'device_id': key,
-                'device_type': event.get('device_type'),
-                'runner_id': event.get('runner_id'),
-                'event': event.get('event'),
-                'timestamp': sent_ts
-            }
-            if event.get('event') == 'login':
-                msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
-            elif event.get('event') == 'results_dump':
-                shifted_punches = []
-                for p in event.get('punches', []):
-                    try:
-                        orig_p_dt = datetime.fromisoformat(p['time'])
-                        shifted_p = (orig_p_dt + shift).isoformat()
-                    except Exception:
-                        shifted_p = p.get('time')
-                    shifted_punches.append({**p, 'time': shifted_p})
-                msg_obj.update({'dump_time': sent_ts, 'punches': shifted_punches, 'note': event.get('note')})
-            elif event.get('event') == 'itkumuuri':
-                msg_obj.update({'status': event.get('status'), 'note': event.get('note')})
-
-            msg = make_message(msg_obj)
-            await device_clients[key].send(msg)
-
-        tasks.append(asyncio.create_task(schedule_and_send(delay, ev, ts)))
-
-    await asyncio.gather(*tasks)
-    await asyncio.gather(*(c.close() for c in device_clients.values()))
-"""
 # --- Simulator core: schedule and send events with speed factor ---
 class DeviceClient:
     def __init__(self, device_id: str, host: str, port: int):
@@ -570,25 +387,27 @@ class DeviceClient:
         device_status[self.device_id] = "closed"
         update_dashboard(self.device_id)
 
-async def run_simulator(events: List[Dict[str,Any]],
+async def run_simulator(events: List[Dict[str, Any]],
                         host: str,
                         port: int,
                         speed: float,
                         one_conn_per_device: bool,
-                        allowed_controls:set,
-                        start_offset: float):
+                        allowed_controls: set,
+                        start_offset: float,
+                        finish_control: Optional[str] = None):
 
     device_clients: Dict[str, DeviceClient] = {}
-    all_timeline: List[Tuple[datetime, Dict[str,Any]]] = [
+
+    # --- 1. Rakenna aikajana syötedatasta ---
+    all_timeline: List[Tuple[datetime, Dict[str, Any]]] = [
         (datetime.fromisoformat(ev['timestamp']), ev) for ev in events
     ]
     if not all_timeline:
         print("No events found.")
         return
-
     all_timeline.sort(key=lambda x: x[0])
 
-    # start-offset käyttöön
+    # --- 2. Sovelletaan start_offset ---
     base_time = all_timeline[0][0]
     offset_td = timedelta(hours=start_offset)
     cutoff_time = base_time + offset_td
@@ -597,16 +416,123 @@ async def run_simulator(events: List[Dict[str,Any]],
         print(f"All events skipped by start-offset {start_offset}h")
         return
 
+    # --- 3. Rakenna punchit juoksijoittain ---
+    all_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
+    for ts, ev in filtered:
+        if ev.get('event') != 'punch':
+            continue
+        runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
+        all_by_runner.setdefault(runner, []).append((ts, ev))
+
+    # Kaikki punchit talteen, vaikka ei olisi allowed
+    published_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
+    for runner, punches in all_by_runner.items():
+        published_by_runner[runner] = list(punches)
+
+    # --- 4. Generoi extra-eventit ---
+    extra_events: List[Tuple[datetime, Dict[str, Any]]] = []
+
+    # mass start -tapahtumat (kiinteät ajat)
+    start_strings = [
+        "2025-06-14T23:00:00+03:00",
+        "2025-06-15T09:30:00+03:00",
+        "2025-06-15T09:45:00+03:00"
+    ]
+    for s in start_strings:
+        ts = datetime.fromisoformat(s)
+        event = {
+            'timestamp': ts.isoformat(),
+            'runner_id': 'mass_start',
+            'device_id': 'mass_start',
+            'device_type': 'mass_start',
+            'event': 'mass_start',
+            'note': 'Mass start at known time'
+        }
+        extra_events.append((ts, event))
+        print(f"Mass start event added at {ts.isoformat()}")
+
+    # login, dump ja itkumuuri
+    for runner, punches in all_by_runner.items():
+        if not punches:
+            continue
+        evs_sorted = sorted(punches, key=lambda x: x[0])
+        first_ts = evs_sorted[0][0]
+        last_ts = evs_sorted[-1][0]
+
+        # login ennen ekaa punchia
+        minutes_before = random.randint(14, 60)
+        login_ts = first_ts - timedelta(minutes=minutes_before)
+        login_event = {
+            'timestamp': login_ts.isoformat(),
+            'runner_id': runner,
+            'device_id': random.choice(LOGIN_DEVICES),
+            'device_type': 'login',
+            'event': 'login',
+            'status': 'ok',
+            'note': f'login {minutes_before}min before first punch'
+        }
+        extra_events.append((login_ts, login_event))
+
+        # dump viimeisen punchin jälkeen
+        minutes_after = random.randint(10, 15)
+        dump_ts = last_ts + timedelta(minutes=minutes_after)
+        punches_dump = [{
+            'control': e.get('device_id'),
+            'time': e.get('timestamp'),
+            'status': e.get('status'),
+            'device_type': e.get('device_type')
+        } for _, e in evs_sorted]
+
+        dump_event = {
+            'timestamp': dump_ts.isoformat(),
+            'runner_id': runner,
+            'device_id': random.choice(DUMP_DEVICES),
+            'device_type': 'results_dump',
+            'event': 'results_dump',
+            'dump_time': dump_ts.isoformat(),
+            'punches': punches_dump,
+            'note': f'dump {minutes_after}min after last punch'
+        }
+        extra_events.append((dump_ts, dump_event))
+
+        # itkumuuri, jos status ei ok
+        runner_status = None
+        for _, e in evs_sorted:
+            if e.get('status'):
+                runner_status = e['status']
+                break
+        if runner_status and runner_status not in ("OK", "Finished"):
+            itkumuuri_delay = random.randint(5, 60)
+            itkumuuri_ts = dump_ts + timedelta(minutes=itkumuuri_delay)
+            itkumuuri_event = {
+                'timestamp': itkumuuri_ts.isoformat(),
+                'runner_id': runner,
+                'device_id': random.choice(ITKUMUURI_DEVICES),
+                'device_type': 'itkumuuri',
+                'event': 'itkumuuri',
+                'status': runner_status,
+                'note': f'itkumuuri {itkumuuri_delay}min after dump (status={runner_status})'
+            }
+            extra_events.append((itkumuuri_ts, itkumuuri_event))
+
+    # --- 5. Yhdistetään kaikki tapahtumat ---
+    combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
+    combined.sort(key=lambda x: x[0])
+
+    # --- 6. Shiftataan nykyhetkeen ---
+    base_time = combined[0][0]
     now = datetime.now(timezone.utc)
-    shift = now - filtered[0][0]
+    shift = now - base_time
 
     tasks = []
-    for ts, ev in filtered:
-        delay = (ts - filtered[0][0]).total_seconds() / speed
+    for ts, ev in combined:
+        delay = (ts - base_time).total_seconds() / speed
 
         async def schedule_and_send(delay_sec, event, original_ts):
+            # ohitetaan punchit, jotka eivät ole allowed
             if event.get('event') == 'punch' and not control_allowed(event.get('device_id'), allowed_controls):
                 return
+
             await asyncio.sleep(max(0.0, delay_sec))
             device_id = event.get('device_id') or f"dev_{event.get('device_type')}"
             key = device_id if one_conn_per_device else f"{device_id}_{int(datetime.now().timestamp()*1000)%1000000}"
@@ -622,19 +548,31 @@ async def run_simulator(events: List[Dict[str,Any]],
                 'event': event.get('event'),
                 'timestamp': sent_ts
             }
-            msg = make_message(msg_obj)
-            #await device_clients[key].send(msg)
-            if key not in device_clients:
-                device_clients[key] = BufferedSender(DeviceClient(key, host, port))
+
+            # rikastetaan extra-eventtejä
+            if event.get('event') == 'login':
+                msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
+            elif event.get('event') == 'results_dump':
+                shifted_punches = []
+                for p in event.get('punches', []):
+                    try:
+                        orig_p_dt = datetime.fromisoformat(p['time'])
+                        shifted_p = (orig_p_dt + shift).isoformat()
+                    except Exception:
+                        shifted_p = p.get('time')
+                    shifted_punches.append({**p, 'time': shifted_p})
+                msg_obj.update({'dump_time': sent_ts, 'punches': shifted_punches, 'note': event.get('note')})
+            elif event.get('event') == 'itkumuuri':
+                msg_obj.update({'status': event.get('status'), 'note': event.get('note')})
 
             await device_clients[key].send(make_message(msg_obj))
 
-
         tasks.append(asyncio.create_task(schedule_and_send(delay, ev, ts)))
-        
 
+    # --- 7. Odotetaan kaikkia ja suljetaan yhteydet ---
     await asyncio.gather(*tasks)
     await asyncio.gather(*(c.close() for c in device_clients.values()))
+
 
 # lisää luokka puskurille
 class BufferedSender:
@@ -680,7 +618,8 @@ def main():
     p.add_argument('-t', '--start-offset', type=float, default=0.0,
                    help='Start offset in hours to skip from beginning of simulation (default 0)')
     p.add_argument('-r', '--team-range', help='Bib numbers to simulate, e.g., "1,3,5,14-55"')
-
+    p.add_argument('-m','--finish-control', type=str, help='Control code for finish punch, will be renamed to maali_1')
+   
     args = p.parse_args()
 
     # Muodosta set bib-numeroista
