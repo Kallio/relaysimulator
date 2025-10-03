@@ -45,8 +45,8 @@ async def ws_sim_handler(request):
     ws = web.WebSocketResponse(max_msg_size=10*1024*1024)
     await ws.prepare(request)
     simulators.add(ws)
-    print(f"New simulator connected, total: {len(simulators)+1}")
     stats['connections'] += 1
+    #print(f"[DEBUG] Connections: {stats['connections']}")
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -91,7 +91,7 @@ async def broadcast_loop():
                     dead.append(d)
             for d in dead:
                 dashboards.discard(d)
-        await asyncio.sleep(1)  # 1 päivitys / s
+        await asyncio.sleep(0.1)  # 1 päivitys / s
 
 # ----------------------
 # App setup
