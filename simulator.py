@@ -379,10 +379,11 @@ async def run_simulator(events: List[Dict[str, Any]],
                         one_conn_per_device: bool,
                         allowed_controls: set,
                         start_offset: float,
-                        finish_control: Optional[str] = None):
+                        finish_control: Optional[str] = None,):
+
     device_clients: Dict[str, DeviceClient] = {}
 
-    # --- 1. Prepare timeline ---
+    # --- 1. Aikajanan valmistelu ---
     all_timeline: List[Tuple[datetime, Dict[str, Any]]] = [
         (datetime.fromisoformat(ev['timestamp']), ev) for ev in events
     ]
@@ -391,7 +392,7 @@ async def run_simulator(events: List[Dict[str, Any]],
         return
     all_timeline.sort(key=lambda x: x[0])
 
-    # --- 2. Apply start offset ---
+    # --- 2. Start offset ---
     base_time = all_timeline[0][0]
     cutoff_time = base_time + timedelta(hours=start_offset)
     filtered = [(ts, ev) for ts, ev in all_timeline if ts >= cutoff_time]
@@ -399,7 +400,7 @@ async def run_simulator(events: List[Dict[str, Any]],
         print(f"All events skipped by start-offset {start_offset}h")
         return
 
-    # --- 3. Organize punches by runner ---
+    # --- 3. Punchit juoksijoittain ---
     all_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
     for ts, ev in filtered:
         if ev.get('event') != 'punch':
@@ -407,11 +408,19 @@ async def run_simulator(events: List[Dict[str, Any]],
         runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
         all_by_runner.setdefault(runner, []).append((ts, ev))
 
-    # --- 4. Extra events ---
+    published_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
+    for runner, punches in all_by_runner.items():
+        published_by_runner[runner] = list(punches)
+
+    # --- 4. Extra eventit ---
     extra_events: List[Tuple[datetime, Dict[str, Any]]] = []
 
     # mass start
-    start_strings = ["2025-06-14T23:00:00+03:00", "2025-06-15T09:30:00+03:00", "2025-06-15T09:45:00+03:00"]
+    start_strings = [
+        "2025-06-14T23:00:00+03:00",
+        "2025-06-15T09:30:00+03:00",
+        "2025-06-15T09:45:00+03:00"
+    ]
     for s in start_strings:
         ts = datetime.fromisoformat(s)
         event = {
@@ -470,7 +479,11 @@ async def run_simulator(events: List[Dict[str, Any]],
         extra_events.append((purku_ts, purku_event))
 
         # itkumuuri
-        runner_status = next((e.get('status') for _, e in evs_sorted if e.get('status')), None)
+        runner_status = None
+        for _, e in evs_sorted:
+            if e.get('status'):
+                runner_status = e['status']
+                break
         if runner_status and runner_status not in ("OK", "Finished"):
             itkumuuri_delay = random.randint(5, 60)
             itkumuuri_ts = purku_ts + timedelta(minutes=itkumuuri_delay)
@@ -485,11 +498,11 @@ async def run_simulator(events: List[Dict[str, Any]],
             }
             extra_events.append((itkumuuri_ts, itkumuuri_event))
 
-    # --- 5. Combine and sort all events ---
-    combined = extra_events + [e for lst in all_by_runner.values() for e in lst]
+    # --- 5. Yhdistä ja järjestä ---
+    combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
     combined.sort(key=lambda x: event_sort_key(x[1]))
 
-    # --- 6. Shift to now ---
+    # --- 6. Shiftataan nykyhetkeen ---
     base_time = combined[0][0]
     now = datetime.now(timezone.utc)
     shift = now - base_time
@@ -499,34 +512,80 @@ async def run_simulator(events: List[Dict[str, Any]],
         delay = (ts - base_time).total_seconds() / speed
 
         async def schedule_and_send(delay_sec, event, original_ts):
+            # ohitetaan punchit, jos ei allowed
             if event.get('event') == 'punch' and not control_allowed(event.get('device_id'), allowed_controls):
                 return
 
-            display_id = event.get('device_id')
+            # finish control -nimetys
             if finish_control and str(event.get("device_id")) == str(finish_control):
-                display_id = "maali_1"
+                event["device_id"] = "maali_1"
                 event["device_type"] = "finish"
 
-            # Ensure one connection per device if requested
-            key = display_id if one_conn_per_device else f"{display_id}_{int(datetime.now().timestamp()*1000)%1000000}"
+            await asyncio.sleep(max(0.0, delay_sec))
+            device_id = event.get('device_id') or f"dev_{event.get('device_type')}"
+            key = device_id if one_conn_per_device else f"{device_id}_{int(datetime.now().timestamp()*1000)%1000000}"
             if key not in device_clients:
                 device_clients[key] = DeviceClient(key, host, port)
                 await device_clients[key].connect()
 
-            await asyncio.sleep(max(0.0, delay_sec))
-
             sent_ts = (original_ts + shift).isoformat()
             msg_obj = {
-                'device_id': display_id,
+                'device_id': key,
                 'device_type': event.get('device_type'),
                 'runner_id': event.get('runner_id'),
                 'event': event.get('event'),
                 'timestamp': sent_ts
             }
 
+            # rikastetaan extra-eventtejä
             if event.get('event') == 'login':
                 msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
-            elif event.get('event') in ('results_purku', 'results_dump'):
+            elif event.get('event') == 'results_purku':
+                shifted_punches = []
+                for p in event.get('punches', []):
+                    try:
+                        orig_p_dt = datetime.fromisoformat(p['time'])
+                        shifted_p = (orig_p_dt + shift).isoformat()
+                    except Exception:
+                        shifted_p = p.get('time')
+                    shifted_punches.append({**p, 'time': shifted_p})
+                msg_obj.update({'purku_time': sent_ts, 'punches': shifted_punches, 'note': event.get('note')})
+            elif event.get('event') == 'itkumuuri':
+                msg_obj.update({'status': event.get('status'), 'note': event.get('note')})
+
+            await device_clients[key].send(make_message(msg_obj))
+
+        async def schedule_and_send(delay_sec, event, original_ts):
+            if event.get('event') == 'punch' and not control_allowed(event.get('device_id'), allowed_controls):
+                return
+
+            # finish control -nimetys
+            if finish_control and str(event.get("device_id")) == str(finish_control):
+                display_id = "maali_1"
+                event["device_type"] = "finish"
+            else:
+                display_id = event.get('device_id') or f"dev_{event.get('device_type')}"
+
+            await asyncio.sleep(max(0.0, delay_sec))
+
+            key = display_id if one_conn_per_device else f"{display_id}_{int(datetime.now().timestamp()*1000)%1000000}"
+            if key not in device_clients:
+                device_clients[key] = DeviceClient(key, host, port)
+                await device_clients[key].connect()
+
+            sent_ts = (original_ts + shift).isoformat()
+            msg_obj = {
+                'device_id': display_id,   # <-- nyt menee oikein
+                'device_type': event.get('device_type'),
+                'runner_id': event.get('runner_id'),
+                'event': event.get('event'),
+                'timestamp': sent_ts
+            }
+
+            # rikastetaan extra-eventtejä...
+            if event.get('event') == 'login':
+                msg_obj.update({'login_time': sent_ts, 'note': event.get('note')})
+            elif event.get('event') == 'results_dump':
                 shifted_punches = []
                 for p in event.get('punches', []):
                     try:
@@ -543,7 +602,7 @@ async def run_simulator(events: List[Dict[str, Any]],
 
         tasks.append(asyncio.create_task(schedule_and_send(delay, ev, ts)))
 
-    # --- 7. Await all tasks and close clients ---
+    # --- 7. Odota kaikki ja sulje ---
     await asyncio.gather(*tasks)
     await asyncio.gather(*(c.close() for c in device_clients.values()))
 
