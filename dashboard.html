@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <title>Osuuksien leimaukset</title>
-  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <!-- Plotly 3.1.1 -->
+  <script src="https://cdn.plot.ly/plotly-3.1.1.min.js"></script>
   <style>
     body { font-family: sans-serif; margin: 0; padding: 0; }
     #plot { width: 100vw; height: 90vh; }
@@ -23,8 +24,16 @@
 
     let legTraces = {};
     let legColors = {};
-    const colorPalette = Plotly.d3.scale.category10();
     const drawnMassStarts = new Set();
+
+    // Simple color palette (fallback instead of Plotly.d3.scale.category10)
+    const baseColors = [
+      '#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+      '#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf'
+    ];
+    function colorForIndex(i) {
+      return baseColors[i % baseColors.length];
+    }
 
     function getLegFromRunner(runnerId) {
       if (!runnerId) return "unknown";
@@ -37,7 +46,7 @@
 
     function getTraceForLeg(leg) {
       if (!legTraces[leg]) {
-        const color = colorPalette(Object.keys(legTraces).length);
+        const color = colorForIndex(Object.keys(legTraces).length);
         legColors[leg] = color;
         legTraces[leg] = {
           x: [],
@@ -48,13 +57,18 @@
           name: leg,
           marker: { color: color, size: 10 }
         };
-        Plotly.addTraces('plot', legTraces[leg]);
+        // If no traces yet, use newPlot to create base, otherwise addTraces
+        const existing = Object.keys(legTraces).length === 1 ? [] : null;
+        if (existing !== null) {
+          Plotly.addTraces('plot', legTraces[leg]);
+        } else {
+          Plotly.addTraces('plot', legTraces[leg]);
+        }
       }
       return legTraces[leg];
     }
 
     function sortControls(arr) {
-      // Categorize controls
       const login = [];
       const mass = [];
       const dump = [];
@@ -70,7 +84,6 @@
         else others.push(c);
       });
 
-      // Keep original relative order within each group
       return [...login, ...mass, ...others, ...dump, ...itk];
     }
 
@@ -89,16 +102,13 @@
       });
     }
 
-
     document.getElementById('resetBtn').addEventListener('click', resetPlot);
 
-    // --- Initial empty plot ---
     resetPlot();
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
 
-      // Mass-start
       if (msg.type === 'mass_start' && msg.timestamp && !drawnMassStarts.has(msg.timestamp)) {
         const startTs = new Date(msg.timestamp);
         Plotly.addTraces('plot', {
@@ -111,8 +121,7 @@
         drawnMassStarts.add(msg.timestamp);
       }
 
-      // Normal punches
-      if (msg.type === 'update' && msg.stats.last) {
+      if (msg.type === 'update' && msg.stats && msg.stats.last) {
         const ev = msg.stats.last;
         const runner = ev.runner_id || "unknown";
         const control = ev.device_id || "unknown";
@@ -120,13 +129,11 @@
 
         eventHistory.push({ ts, control, runner });
 
-              if (!controls.includes(control)) {
+        if (!controls.includes(control)) {
           controls.push(control);
           const sorted = sortControls(controls);
-          // preserve controls as inserted but set sorted order for plotting
           Plotly.relayout('plot', { 'yaxis.categoryarray': sorted });
         }
-
 
         const windowStart = new Date(ts.getTime() - 5*60000);
         const windowEnd   = new Date(ts.getTime() + 5*60000);
@@ -140,11 +147,13 @@
 
         const trace = getTraceForLeg(leg);
 
+        // find trace index for this leg
+        const traceIndex = Object.keys(legTraces).indexOf(leg);
         Plotly.extendTraces('plot', {
           x: [[ts]],
           y: [[control]],
           text: [[tooltip]]
-        }, [Object.keys(legTraces).indexOf(leg)]);
+        }, [traceIndex]);
       }
     };
   </script>
