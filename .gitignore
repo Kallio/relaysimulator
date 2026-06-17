@@ -1,2 +1,4 @@
 /jukolasim_venv
 /data/*
+.DS_Store
+results_j2025_ve_iof.xml
