@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/phyvarin/Documents/GitHub/navisport/desktop-client/**)",
+      "Bash(grep -E \"\\\\.\\(ts|tsx|js|jsx|py\\)$\")"
+    ]
+  }
+}

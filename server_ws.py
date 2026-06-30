@@ -116,12 +116,14 @@ if __name__ == '__main__':
 
 # Tarkistetaan max open files
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-    MIN_FILES_REQUIRED = 4096
+    DESIRED = 4096
+    if soft_limit < DESIRED:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(DESIRED, hard_limit), hard_limit))
+            soft_limit = min(DESIRED, hard_limit)
+            print(f"Raised open-file limit to {soft_limit}")
+        except Exception as e:
+            print(f"Warning: could not raise open-file limit ({soft_limit} < {DESIRED}): {e}")
 
-    if soft_limit < MIN_FILES_REQUIRED:
-        print(f"ERROR: Max open files (ulimit -n) too low: {soft_limit}")
-        print(f"Please increase it to at least {MIN_FILES_REQUIRED} before running the server.")
-        sys.exit(1)
-
-    print(f"Max open files ok: {soft_limit}")
+    print(f"Max open files: {soft_limit}")
     web.run_app(app, host=HOST, port=HTTP_PORT,backlog=4096)
