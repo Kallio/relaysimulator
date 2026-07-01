@@ -5,6 +5,7 @@ import asyncio
 import xml.etree.ElementTree as ET
 import json
 import random
+import threading
 import aiohttp
 import websockets
 import os
@@ -35,6 +36,8 @@ class NavisportSender:
     they never block the asyncio event loop.
     """
 
+    CHECKPOINT_REFRESH_INTERVAL = 300  # seconds
+
     def __init__(self, host: str, event_id: str, chip_base: int = 0, debug: bool = False):
         self.host = host
         self.event_id = event_id
@@ -43,18 +46,85 @@ class NavisportSender:
         self._cp_by_code: Dict[str, dict] = {}   # control code → checkpoint
         self._start_times: Dict[str, str] = {}   # runner_id → ISO start timestamp
         self._result_ids: Dict[str, str] = {}    # chip → result_id
+        self._unknown_codes: set = set()          # codes warned about already
         self._debug = debug
         self._debug_lock = threading.Lock()       # serialise interactive prompts
+        self._refresh_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _build_cp_map(cps: list) -> dict:
+        """Build code→checkpoint dict; falls back to name when code is None."""
+        m: Dict[str, dict] = {}
+        for cp in (cps or []):
+            code = cp.get('code')
+            if code is not None:
+                m[str(code)] = cp
+            elif cp.get('name'):
+                m[str(cp['name'])] = cp
+        return m
 
     async def connect(self):
         loop = asyncio.get_event_loop()
         conn = NavisportConnector(host=self.host)
         await loop.run_in_executor(None, conn.connect)
         self._conn = conn
-        cps = await loop.run_in_executor(None, conn.get_checkpoints, self.event_id)
-        self._cp_by_code = {cp['code']: cp for cp in (cps or []) if cp.get('code')}
+
+        # Fetch event with retries — Event/Select can be slow right after connect
+        event = None
+        cps: list = []
+        for attempt in range(1, 4):
+            event = await loop.run_in_executor(None, conn.get_event, self.event_id)
+            if event is not None:
+                cps = event.get('checkpoints') or []
+                break
+            wait = attempt * 2
+            suffix = f", retrying in {wait}s…" if attempt < 3 else ", giving up."
+            print(f"[navisport] Event/Select returned nothing (attempt {attempt}/3){suffix}")
+            if attempt < 3:
+                await asyncio.sleep(wait)
+
+        if event is None:
+            print(f"[navisport] ERROR: Could not fetch event {self.event_id}")
+            print(f"[navisport]        Verify the event UUID and that Navisport has it loaded.")
+        elif not cps:
+            print(f"[navisport] Event '{event.get('name', '?')}' found but has 0 checkpoints configured")
+
+        self._cp_by_code = self._build_cp_map(cps)
         print(f"[navisport] Connected to {self.host}, event {self.event_id}, "
-              f"{len(self._cp_by_code)} checkpoints cached")
+              f"{len(self._cp_by_code)}/{len(cps)} checkpoints cached"
+              + (f" ({len(cps) - len(self._cp_by_code)} skipped — no code or name)" if cps else ""))
+        if self._cp_by_code:
+            print(f"  {'key':<8} {'type':<12} {'name':<30} {'devices':<40} id")
+            print(f"  {'-'*8} {'-'*12} {'-'*30} {'-'*40} {'-'*36}")
+            for key, cp in sorted(self._cp_by_code.items(),
+                                  key=lambda kv: (kv[1].get('type', ''), kv[0])):
+                ctype = cp.get('type', '')
+                name = cp.get('name', '')
+                devices = ', '.join(cp.get('devices') or []) or '-'
+                print(f"  {key:<8} {ctype:<12} {name:<30} {devices:<40} {cp['id']}")
+        self._refresh_task = asyncio.create_task(self._checkpoint_refresh_loop())
+
+    async def _checkpoint_refresh_loop(self):
+        """Refresh checkpoint map every CHECKPOINT_REFRESH_INTERVAL seconds."""
+        while True:
+            await asyncio.sleep(self.CHECKPOINT_REFRESH_INTERVAL)
+            if not self._conn:
+                break
+            try:
+                loop = asyncio.get_event_loop()
+                cps = await loop.run_in_executor(None, self._conn.get_checkpoints, self.event_id)
+                new_map = self._build_cp_map(cps)
+                added = sorted(set(new_map) - set(self._cp_by_code))
+                self._cp_by_code = new_map
+                if added:
+                    # Clear unknown-code warnings for newly added codes so punches can now flow
+                    self._unknown_codes -= set(added)
+                    print(f"[navisport] checkpoints refreshed: {len(new_map)} total, "
+                          f"new codes: {', '.join(added)}")
+                else:
+                    print(f"[navisport] checkpoints refreshed: {len(new_map)} total, no changes")
+            except Exception as e:
+                print(f"[navisport] checkpoint refresh failed: {e}")
 
     def _resolve_chip(self, ev: Dict) -> str:
         bib = int(ev.get('team_id', 0))
@@ -118,8 +188,19 @@ class NavisportSender:
                     sys.exit(0)
                 print("[debug] Enter y, n, a, or q.")
 
+    @staticmethod
+    def _strip_nulls(d: dict) -> dict:
+        return {k: v for k, v in d.items() if v is not None}
+
+    @staticmethod
+    def _navisport_ts(ts: str) -> str:
+        """Normalise any ISO timestamp to Navisport's expected UTC format: 2026-07-01T15:21:35.031Z"""
+        dt = datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone(timezone.utc)
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f"{dt.microsecond // 1000:03d}Z"
+
     def _send_result(self, result: dict, event_id: str, label: str = '') -> str:
         """Send a Result/Update, optionally gated by debug confirmation."""
+        result = self._strip_nulls(result)
         if self._debug:
             tag = label or (
                 f"Result/Update  type={result.get('resultType','?')}  "
@@ -132,6 +213,7 @@ class NavisportSender:
 
     def _send_passing(self, passing: dict, label: str = '') -> str:
         """Send a Passing/Update, optionally gated by debug confirmation."""
+        passing = self._strip_nulls(passing)
         if self._debug:
             tag = label or (
                 f"Passing/Update  chip={passing.get('chip','?')}  "
@@ -230,13 +312,33 @@ class NavisportSender:
         device_type = ev.get('device_type', '')
         chip = self._resolve_chip(ev)
         cp_id, dev_id = self._checkpoint_for(code)
-        elapsed = self._compute_elapsed(runner_id, timestamp)
+        is_finish = device_type == 'finish' or str(code).lower() in ('maali', 'finish', 'f')
+
+        if cp_id is None and not is_finish:
+            if code not in self._unknown_codes:
+                print(f"[navisport] skip: no checkpoint for control '{code}' — punch not sent")
+                self._unknown_codes.add(code)
+            return
+
+        # Elapsed from original IOF timestamps — the time-shift cancels out
+        orig_ts_str = ev.get('timestamp')
+        orig_start_str = ev.get('start_time') or self._start_times.get(runner_id)
+        elapsed = None
+        if orig_ts_str and orig_start_str:
+            try:
+                s = datetime.fromisoformat(orig_start_str.replace('Z', '+00:00'))
+                t = datetime.fromisoformat(orig_ts_str.replace('Z', '+00:00'))
+                elapsed = max(0, int((t - s).total_seconds()))
+            except Exception:
+                pass
+
+        navi_ts = self._navisport_ts(timestamp)
         passing = {
             'id': str(uuid.uuid4()),
             'eventId': self.event_id,
             'chip': chip,
             'deviceId': dev_id,
-            'timestamp': timestamp,
+            'timestamp': navi_ts,
             'checkpointId': cp_id,
         }
         if elapsed is not None:
@@ -248,11 +350,11 @@ class NavisportSender:
                            f"Passing/Update  chip={chip}  control={code}  "
                            f"elapsed={elapsed}s  cp={'found' if cp_id else 'unknown'}")
 
-        is_finish = device_type == 'finish' or str(code).lower() in ('maali', 'finish', 'f')
         if is_finish:
-            self._sync_finish_result(chip, timestamp, elapsed)
+            self._sync_finish_result(chip, navi_ts, elapsed, orig_punch_ts=orig_ts_str)
 
-    def _sync_finish_result(self, chip: str, timestamp: str, elapsed: Optional[int]):
+    def _sync_finish_result(self, chip: str, timestamp: str, elapsed: Optional[int],
+                            orig_punch_ts: Optional[str] = None):
         """Send Result/Update with finishTime for the finishing runner."""
         event = self._conn.get_event(self.event_id)
         if not event:
@@ -272,11 +374,11 @@ class NavisportSender:
         )
         if not result:
             return
-        # Fallback: compute elapsed from result.startTime if not cached locally
-        if elapsed is None and result.get('startTime'):
+        # Fallback: use original IOF punch time vs stored IOF start time (shift cancels out)
+        if elapsed is None and orig_punch_ts and result.get('startTime'):
             try:
                 s = datetime.fromisoformat(result['startTime'].replace('Z', '+00:00'))
-                t = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                t = datetime.fromisoformat(orig_punch_ts.replace('Z', '+00:00'))
                 elapsed = max(0, int((t - s).total_seconds()))
             except Exception:
                 pass
@@ -375,6 +477,13 @@ class NavisportSender:
             await loop.run_in_executor(None, self._sync_send_purku, event, punches, sent_ts)
 
     async def close(self):
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
         if self._conn:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._conn.disconnect)
@@ -605,7 +714,8 @@ def parse_team_range(range_str: str) -> set[int]:
 
 # --- IOF XML parsing ---
 def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
-                      team_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                      team_limit: Optional[int] = None,
+                      max_legs: Optional[int] = None) -> List[Dict[str, Any]]:
     tree = ET.parse(iof_path)
     root = tree.getroot()
     ns_uri = root.tag.split('}')[0].strip('{') if '}' in root.tag else None
@@ -644,6 +754,8 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
             continue
 
         for idx, member in enumerate(members, start=1):
+            if max_legs and idx > max_legs:
+                break
             person_id = None
             person_el = member.find('iof:Person', ns)
             if person_el is not None:
@@ -1226,6 +1338,8 @@ def main():
     p.add_argument('-r', '--team-range', help='Bib numbers to simulate, e.g., "1,3,5,14-55"')
     p.add_argument('--limit-teams', type=int, default=None,
                    help='Only process the first N teams (XML order, after --team-range filter)')
+    p.add_argument('--legs', type=int, default=None,
+                   help='Only simulate the first N legs of each team (e.g. --legs 1)')
     p.add_argument('-m','--finish-control', type=str, help='Control code for finish punch, will be renamed to maali_1')
     p.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH,
                    help=f'Config file path (default: {DEFAULT_CONFIG_PATH})')
@@ -1288,7 +1402,7 @@ def main():
             return
 
     events = parse_iof3_events(args.iof, team_range=team_range,
-                               team_limit=args.limit_teams)
+                               team_limit=args.limit_teams, max_legs=args.legs)
     ws_info = "disabled (--no-ws)" if args.no_ws else f"{args.host}:{args.port}"
     print(f"Parsed {len(events)} events. Speed={args.speed} WS={ws_info}")
 
