@@ -162,6 +162,36 @@ class NavisportSender:
     # Helpers (sync, called from executor threads)
     # ------------------------------------------------------------------
 
+    def _find_result(self, ev: Dict, all_results: list) -> Optional[dict]:
+        """Find an Individual result by chip, falling back to bib+leg lookup."""
+        chip = self._resolve_chip(ev)
+        result = next(
+            (r for r in all_results
+             if str(r.get('chip', '')) == chip or str(r.get('secondaryChip', '')) == chip),
+            None,
+        )
+        if result:
+            return result
+        bib = int(ev.get('team_id', 0))
+        leg = ev.get('leg', 1) or 1
+        if bib <= 0:
+            return None
+        team = next(
+            (r for r in all_results
+             if r.get('resultType') == 'Team'
+             and str(r.get('bibNumber', '')) == str(bib)),
+            None,
+        )
+        if not team:
+            return None
+        return next(
+            (r for r in all_results
+             if r.get('resultType') == 'Individual'
+             and r.get('parentId') == team['id']
+             and r.get('leg') == leg),
+            None,
+        )
+
     def _checkpoint_for(self, code: str) -> Tuple[Optional[str], Optional[str]]:
         cp = self._cp_by_code.get(str(code))
         if cp:
@@ -463,13 +493,9 @@ class NavisportSender:
             return
         runner_id = str(ev.get('runner_id', ''))
         chip = self._resolve_chip(ev)
-        result = next(
-            (r for r in event_data.get('results', [])
-             if str(r.get('chip', '')) == chip or str(r.get('secondaryChip', '')) == chip),
-            None,
-        )
+        result = self._find_result(ev, event_data.get('results', []))
         if not result:
-            print(f"[navisport] purku: no result found for chip {chip}")
+            print(f"[navisport] purku: no result for chip {chip} (bib={ev.get('team_id')} leg={ev.get('leg')})")
             return
 
         start_time_str = self._start_times.get(runner_id) or result.get('startTime')
@@ -517,6 +543,32 @@ class NavisportSender:
         print(f"[navisport] purku: sent {len(controls)} punches for chip {chip}"
               f"  status: {iof_status}→{navi_status or '(Navisport validates)'}")
 
+    def _sync_send_status_update(self, ev: Dict, timestamp: str):
+        """Send Result/Update with the IOF status for runners who have no chip data (DNS/DNF/DSQ)."""
+        if not self._conn:
+            return
+        iof_status = ev.get('runner_status', '')
+        navi_status = self._map_iof_status(iof_status)
+        if not navi_status:
+            return  # nothing to set (OK runners go through purku instead)
+        event_data = self._conn.get_event(self.event_id)
+        if not event_data:
+            return
+        chip = self._resolve_chip(ev)
+        result = self._find_result(ev, event_data.get('results', []))
+        if not result:
+            print(f"[navisport] status_update: no result for chip {chip} (bib={ev.get('team_id')} leg={ev.get('leg')})")
+            return
+        updated = {
+            **result,
+            'status': navi_status,
+            'updated': _navi_now_iso(),
+        }
+        self._send_result(updated, self.event_id,
+                          f"Result/Update [status_update]  chip={chip}  "
+                          f"iof={iof_status}→navi={navi_status}")
+        print(f"[navisport] status_update: chip={chip}  {iof_status}→{navi_status}")
+
     def _sync_send_manual_ok(self, ev: Dict, timestamp: str):
         """Send Result/Update with status='Ok' — simulates officials approving from paper backup."""
         if not self._conn:
@@ -525,13 +577,9 @@ class NavisportSender:
         if not event_data:
             return
         chip = self._resolve_chip(ev)
-        result = next(
-            (r for r in event_data.get('results', [])
-             if str(r.get('chip', '')) == chip or str(r.get('secondaryChip', '')) == chip),
-            None,
-        )
+        result = self._find_result(ev, event_data.get('results', []))
         if not result:
-            print(f"[navisport] manual_ok: no result for chip {chip}")
+            print(f"[navisport] manual_ok: no result for chip {chip} (bib={ev.get('team_id')} leg={ev.get('leg')})")
             return
         updated = {
             **result,
@@ -567,6 +615,9 @@ class NavisportSender:
             # Use shifted punches from msg_obj (timestamps already adjusted for sim speed)
             punches = (msg_obj or {}).get('punches', event.get('punches', []))
             await loop.run_in_executor(None, self._sync_send_purku, event, punches, sent_ts)
+
+        elif etype == 'status_update':
+            await loop.run_in_executor(None, self._sync_send_status_update, event, sent_ts)
 
         elif etype == 'manual_ok':
             await loop.run_in_executor(None, self._sync_send_manual_ok, event, sent_ts)
@@ -883,6 +934,7 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
 
             status_txt = result.findtext('iof:Status', namespaces=ns)
 
+            split_count = 0
             for split in result.findall('iof:SplitTime', ns):
                 code = split.findtext('iof:ControlCode', namespaces=ns)
                 time_txt = split.findtext('iof:Time', namespaces=ns)
@@ -903,6 +955,7 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
                             ts = start_dt
 
                 if ts:
+                    split_count += 1
                     events.append({
                         'timestamp': ts.isoformat(),
                         'runner_id': person_id,
@@ -917,6 +970,25 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
                         'leg': idx,
                         'start_time': start_dt.isoformat() if start_dt else None,
                     })
+
+            # Runners with no split times but a non-OK status (DNS, DSQ, DNF before
+            # first control) need a synthetic marker so they enter the pipeline and
+            # get a login event + a later status update sent to Navisport.
+            if split_count == 0 and status_txt and status_txt.upper() != 'OK':
+                marker_ts = start_dt or datetime.now(timezone.utc)
+                events.append({
+                    'timestamp': marker_ts.isoformat(),
+                    'runner_id': person_id,
+                    'runner_name': runner_name,
+                    'club': club,
+                    'team_id': team_bib_text,
+                    'device_id': 'status_marker',
+                    'device_type': 'status_only',
+                    'status': status_txt,
+                    'event': 'status_only',
+                    'leg': idx,
+                    'start_time': start_dt.isoformat() if start_dt else None,
+                })
 
     events.sort(key=lambda e: e['timestamp'])
     print(f"Teams in XML: {all_teams_count}")
@@ -1174,14 +1246,17 @@ async def run_simulator(events: List[Dict[str, Any]],
     # --- 3. Punchit juoksijoittain ---
     all_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
     for ts, ev in filtered:
-        if ev.get('event') != 'punch':
+        if ev.get('event') not in ('punch', 'status_only'):
             continue
         runner = ev.get('runner_id') or ev.get('runner_name') or 'unknown'
         all_by_runner.setdefault(runner, []).append((ts, ev))
 
+    # Only real punch events are published to the WebSocket relay
     published_by_runner: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
     for runner, punches in all_by_runner.items():
-        published_by_runner[runner] = list(punches)
+        real = [(ts, e) for ts, e in punches if e.get('event') == 'punch']
+        if real:
+            published_by_runner[runner] = real
 
     # --- 4. Extra eventit ---
     extra_events: List[Tuple[datetime, Dict[str, Any]]] = []
@@ -1213,72 +1288,90 @@ async def run_simulator(events: List[Dict[str, Any]],
         combined = extra_events + [e for lst in published_by_runner.values() for e in lst]
 
     if not login_only:
-        # dump, itkumuuri
+        # dump, status updates, itkumuuri
         for runner, punches in all_by_runner.items():
             if not punches:
                 continue
             evs_sorted = sorted(punches, key=lambda x: x[0])
-            last_ts = evs_sorted[-1][0]
+            first_ev = evs_sorted[0][1]
+            iof_runner_status = first_ev.get('status') or ''
+            has_real_punches = any(e.get('event') == 'punch' for _, e in evs_sorted)
 
-            # purku (chip dump after finish)
-            minutes_after = random.randint(10, 15)
-            purku_ts = last_ts + timedelta(minutes=minutes_after)
-            punches_dump = [{
-                'control': e.get('device_id'),
-                'time': e.get('timestamp'),
-                'status': e.get('status'),
-                'device_type': e.get('device_type')
-            } for _, e in evs_sorted]
+            if has_real_punches:
+                # --- purku (chip dump after finish) ---
+                last_ts = evs_sorted[-1][0]
+                minutes_after = random.randint(10, 15)
+                purku_ts = last_ts + timedelta(minutes=minutes_after)
+                punches_dump = [{
+                    'control': e.get('device_id'),
+                    'time': e.get('timestamp'),
+                    'status': e.get('status'),
+                    'device_type': e.get('device_type')
+                } for _, e in evs_sorted if e.get('event') == 'punch']
 
-            first_punch = evs_sorted[0][1]
-            purku_event = {
-                'timestamp': purku_ts.isoformat(),
-                'runner_id': runner,
-                'team_id': first_punch.get('team_id'),
-                'leg': first_punch.get('leg'),
-                'runner_status': first_punch.get('status'),  # IOF XML status: OK/DidNotFinish/DidNotStart/Disqualified
-                'device_id': random.choice(PURKU_DEVICES),
-                'device_type': 'results_purku',
-                'event': 'results_purku',
-                'purku_time': purku_ts.isoformat(),
-                'punches': punches_dump,
-                'note': f'purku {minutes_after}min after last punch'
-            }
-            extra_events.append((purku_ts, purku_event))
-
-            iof_runner_status = first_punch.get('status') or ''
-
-            # manual_ok — officials approve the result from backup paper for OK runners
-            # Simulates the case where the chip died mid-race but paper punches are OK.
-            if iof_runner_status.upper() == 'OK':
-                ok_delay = random.randint(20, 60)
-                ok_ts = purku_ts + timedelta(minutes=ok_delay)
-                extra_events.append((ok_ts, {
-                    'timestamp': ok_ts.isoformat(),
+                extra_events.append((purku_ts, {
+                    'timestamp': purku_ts.isoformat(),
                     'runner_id': runner,
-                    'team_id': first_punch.get('team_id'),
-                    'leg': first_punch.get('leg'),
-                    'device_id': 'officials',
-                    'device_type': 'manual_ok',
-                    'event': 'manual_ok',
-                    'note': f'manual OK {ok_delay}min after purku (backup paper)',
+                    'team_id': first_ev.get('team_id'),
+                    'leg': first_ev.get('leg'),
+                    'runner_status': iof_runner_status,
+                    'device_id': random.choice(PURKU_DEVICES),
+                    'device_type': 'results_purku',
+                    'event': 'results_purku',
+                    'purku_time': purku_ts.isoformat(),
+                    'punches': punches_dump,
+                    'note': f'purku {minutes_after}min after last punch'
                 }))
 
-            # itkumuuri (DQ appeal desk)
-            runner_status = iof_runner_status or None
-            if runner_status and runner_status not in ("OK", "Finished"):
+                # manual_ok — officials approve from backup paper for OK runners
+                if iof_runner_status.upper() == 'OK':
+                    ok_delay = random.randint(20, 60)
+                    ok_ts = purku_ts + timedelta(minutes=ok_delay)
+                    extra_events.append((ok_ts, {
+                        'timestamp': ok_ts.isoformat(),
+                        'runner_id': runner,
+                        'team_id': first_ev.get('team_id'),
+                        'leg': first_ev.get('leg'),
+                        'device_id': 'officials',
+                        'device_type': 'manual_ok',
+                        'event': 'manual_ok',
+                        'note': f'manual OK {ok_delay}min after purku (backup paper)',
+                    }))
+
+            else:
+                # --- status_update for DNS/DNF/DSQ runners with no chip data ---
+                # Fire shortly after their scheduled start time so Navisport reflects
+                # the correct status without waiting for a chip download.
+                start_ts = evs_sorted[0][0]
+                delay_min = random.randint(5, 20)
+                su_ts = start_ts + timedelta(minutes=delay_min)
+                extra_events.append((su_ts, {
+                    'timestamp': su_ts.isoformat(),
+                    'runner_id': runner,
+                    'team_id': first_ev.get('team_id'),
+                    'leg': first_ev.get('leg'),
+                    'runner_status': iof_runner_status,
+                    'device_id': 'officials',
+                    'device_type': 'status_update',
+                    'event': 'status_update',
+                    'note': f'status update {delay_min}min after start (no chip data, status={iof_runner_status})',
+                }))
+
+            # itkumuuri (DQ appeal desk) — DNS runners do not appeal
+            if (iof_runner_status
+                    and iof_runner_status.upper() not in ('OK', 'FINISHED', 'DIDNOTSTART')):
+                ref_ts = evs_sorted[-1][0]
                 itkumuuri_delay = random.randint(5, 60)
-                itkumuuri_ts = purku_ts + timedelta(minutes=itkumuuri_delay)
-                itkumuuri_event = {
+                itkumuuri_ts = ref_ts + timedelta(minutes=itkumuuri_delay)
+                extra_events.append((itkumuuri_ts, {
                     'timestamp': itkumuuri_ts.isoformat(),
                     'runner_id': runner,
                     'device_id': random.choice(ITKUMUURI_DEVICES),
                     'device_type': 'itkumuuri',
                     'event': 'itkumuuri',
-                    'status': runner_status,
-                    'note': f'itkumuuri {itkumuuri_delay}min after dump (status={runner_status})'
-                }
-                extra_events.append((itkumuuri_ts, itkumuuri_event))
+                    'status': iof_runner_status,
+                    'note': f'itkumuuri {itkumuuri_delay}min after last event (status={iof_runner_status})'
+                }))
 
     # --- 5. Yhdistä ja järjestä ---
     if not login_only:
