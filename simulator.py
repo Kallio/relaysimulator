@@ -1323,10 +1323,26 @@ async def run_simulator(events: List[Dict[str, Any]],
                     'note': f'purku {minutes_after}min after last punch'
                 }))
 
-                # manual_ok — officials approve from backup paper for OK runners
+                # OK runners: hylkäysesitys → itkumuuri → manual_ok
+                # Purku may detect missing punches and set a temporary Dnf
+                # (hylkäysesitys). The runner appeals at itkumuuri where
+                # officials verify the backup paper and approve the result.
                 if iof_runner_status.upper() == 'OK':
-                    ok_delay = random.randint(20, 60)
-                    ok_ts = purku_ts + timedelta(minutes=ok_delay)
+                    itkumuuri_delay = random.randint(5, 15)
+                    itkumuuri_ts = purku_ts + timedelta(minutes=itkumuuri_delay)
+                    extra_events.append((itkumuuri_ts, {
+                        'timestamp': itkumuuri_ts.isoformat(),
+                        'runner_id': runner,
+                        'team_id': first_ev.get('team_id'),
+                        'leg': first_ev.get('leg'),
+                        'device_id': random.choice(ITKUMUURI_DEVICES),
+                        'device_type': 'itkumuuri',
+                        'event': 'itkumuuri',
+                        'status': 'Ok',
+                        'note': f'hylkäysesitys → itkumuuri {itkumuuri_delay}min after purku',
+                    }))
+                    ok_extra = random.randint(5, 45)
+                    ok_ts = itkumuuri_ts + timedelta(minutes=ok_extra)
                     extra_events.append((ok_ts, {
                         'timestamp': ok_ts.isoformat(),
                         'runner_id': runner,
@@ -1335,7 +1351,8 @@ async def run_simulator(events: List[Dict[str, Any]],
                         'device_id': 'officials',
                         'device_type': 'manual_ok',
                         'event': 'manual_ok',
-                        'note': f'manual OK {ok_delay}min after purku (backup paper)',
+                        'note': (f'manual OK {itkumuuri_delay + ok_extra}min after purku '
+                                 f'(paper approved at itkumuuri)'),
                     }))
 
             else:
@@ -1357,7 +1374,8 @@ async def run_simulator(events: List[Dict[str, Any]],
                     'note': f'status update {delay_min}min after start (no chip data, status={iof_runner_status})',
                 }))
 
-            # itkumuuri (DQ appeal desk) — DNS runners do not appeal
+            # itkumuuri for DNF/DSQ runners — OK runners handled above,
+            # DNS runners do not appeal
             if (iof_runner_status
                     and iof_runner_status.upper() not in ('OK', 'FINISHED', 'DIDNOTSTART')):
                 ref_ts = evs_sorted[-1][0]
