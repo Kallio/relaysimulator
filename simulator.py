@@ -49,6 +49,8 @@ class NavisportSender:
         self._unknown_codes: set = set()          # codes warned about already
         self._debug = debug
         self._debug_lock = threading.Lock()       # serialise interactive prompts
+        self._debug_gate: Optional[asyncio.Event] = None  # asyncio gate: cleared while a prompt is shown
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._refresh_task: Optional[asyncio.Task] = None
 
     @staticmethod
@@ -68,6 +70,10 @@ class NavisportSender:
         conn = NavisportConnector(host=self.host)
         await loop.run_in_executor(None, conn.connect)
         self._conn = conn
+        self._loop = loop
+        if self._debug:
+            self._debug_gate = asyncio.Event()
+            self._debug_gate.set()  # initially unblocked
 
         # Fetch event with retries — Event/Select can be slow right after connect
         event = None
@@ -102,6 +108,24 @@ class NavisportSender:
                 name = cp.get('name', '')
                 devices = ', '.join(cp.get('devices') or []) or '-'
                 print(f"  {key:<8} {ctype:<12} {name:<30} {devices:<40} {cp['id']}")
+
+        # Require at least one Finish checkpoint with a device attached
+        finish_cps = [cp for cp in self._cp_by_code.values() if cp.get('type', '').lower() == 'finish']
+        if not finish_cps:
+            raise RuntimeError(
+                "[navisport] No Finish checkpoint configured for this event. "
+                "Add a Finish checkpoint in Navisport before running the simulator."
+            )
+        finish_no_device = [cp for cp in finish_cps if not cp.get('devices')]
+        if finish_no_device:
+            codes = ', '.join(
+                str(cp.get('code') or cp.get('name', '?')) for cp in finish_no_device
+            )
+            raise RuntimeError(
+                f"[navisport] Finish checkpoint(s) {codes} have no device attached. "
+                "Assign a timing device to the Finish checkpoint in Navisport before running the simulator."
+            )
+
         self._refresh_task = asyncio.create_task(self._checkpoint_refresh_loop())
 
     async def _checkpoint_refresh_loop(self):
@@ -138,12 +162,12 @@ class NavisportSender:
     # Helpers (sync, called from executor threads)
     # ------------------------------------------------------------------
 
-    def _checkpoint_for(self, code: str) -> Tuple[Optional[str], str]:
+    def _checkpoint_for(self, code: str) -> Tuple[Optional[str], Optional[str]]:
         cp = self._cp_by_code.get(str(code))
         if cp:
             devices = cp.get('devices') or []
-            return cp['id'], devices[0] if devices else str(code)
-        return None, str(code)
+            return cp['id'], devices[0] if devices else None
+        return None, None
 
     def _compute_elapsed(self, runner_id: str, timestamp: str) -> Optional[int]:
         start = self._start_times.get(str(runner_id))
@@ -164,29 +188,37 @@ class NavisportSender:
         """
         import json as _json
         with self._debug_lock:
-            print(f"\n[debug] {'─'*60}")
-            print(f"[debug]  {label}")
-            print(f"[debug] {'─'*60}")
-            print(_json.dumps(payload, indent=2, ensure_ascii=False))
-            while True:
-                try:
-                    ans = input("[debug] Send? [y]es / [n]o / [a]ll (disable debug) / [q]uit: ").strip().lower()
-                except EOFError:
-                    return True
-                if ans in ('y', 'yes', ''):
-                    return True
-                if ans in ('n', 'no'):
-                    print("[debug] Skipped.")
-                    return False
-                if ans in ('a', 'all'):
-                    self._debug = False
-                    print("[debug] Debug mode off — sending all remaining commands automatically.")
-                    return True
-                if ans in ('q', 'quit', 'exit'):
-                    print("[debug] Quit.")
-                    import sys
-                    sys.exit(0)
-                print("[debug] Enter y, n, a, or q.")
+            # Pause the asyncio scheduler so no new events are dispatched while we wait for input
+            if self._loop and self._debug_gate:
+                self._loop.call_soon_threadsafe(self._debug_gate.clear)
+            try:
+                print(f"\n[debug] {'─'*60}")
+                print(f"[debug]  {label}")
+                print(f"[debug] {'─'*60}")
+                print(_json.dumps(payload, indent=2, ensure_ascii=False))
+                while True:
+                    try:
+                        ans = input("[debug] Send? [y]es / [n]o / [a]ll (disable debug) / [q]uit: ").strip().lower()
+                    except EOFError:
+                        return True
+                    if ans in ('y', 'yes', ''):
+                        return True
+                    if ans in ('n', 'no'):
+                        print("[debug] Skipped.")
+                        return False
+                    if ans in ('a', 'all'):
+                        self._debug = False
+                        print("[debug] Debug mode off — sending all remaining commands automatically.")
+                        return True
+                    if ans in ('q', 'quit', 'exit'):
+                        print("[debug] Quit.")
+                        import sys
+                        sys.exit(0)
+                    print("[debug] Enter y, n, a, or q.")
+            finally:
+                # Unblock the asyncio scheduler — next event may now proceed
+                if self._loop and self._debug_gate:
+                    self._loop.call_soon_threadsafe(self._debug_gate.set)
 
     @staticmethod
     def _strip_nulls(d: dict) -> dict:
@@ -312,7 +344,12 @@ class NavisportSender:
         device_type = ev.get('device_type', '')
         chip = self._resolve_chip(ev)
         cp_id, dev_id = self._checkpoint_for(code)
-        is_finish = device_type == 'finish' or str(code).lower() in ('maali', 'finish', 'f')
+        cp_type = (self._cp_by_code.get(str(code)) or {}).get('type', '')
+        is_finish = (
+            device_type == 'finish'
+            or str(code).lower() in ('maali', 'finish', 'f')
+            or cp_type.lower() == 'finish'
+        )
 
         if cp_id is None and not is_finish:
             if code not in self._unknown_codes:
@@ -462,6 +499,10 @@ class NavisportSender:
     async def on_event(self, event: Dict[str, Any], sent_ts: str, msg_obj: Optional[Dict[str, Any]] = None):
         if not self._conn:
             return
+        # In debug mode, wait until the current prompt (if any) is answered
+        # before dispatching this event to an executor thread.
+        if self._debug_gate:
+            await self._debug_gate.wait()
         loop = asyncio.get_event_loop()
         etype = event.get('event')
 
@@ -1135,9 +1176,12 @@ async def run_simulator(events: List[Dict[str, Any]],
                 'device_type': e.get('device_type')
             } for _, e in evs_sorted]
 
+            first_punch = evs_sorted[0][1]
             purku_event = {
                 'timestamp': purku_ts.isoformat(),
                 'runner_id': runner,
+                'team_id': first_punch.get('team_id'),
+                'leg': first_punch.get('leg'),
                 'device_id': random.choice(PURKU_DEVICES),
                 'device_type': 'results_purku',
                 'event': 'results_purku',
