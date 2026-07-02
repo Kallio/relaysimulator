@@ -91,20 +91,32 @@ Scheduled 10–15 minutes after the runner's last punch. Sends a full
 For `OK` runners, `status` is intentionally omitted so Navisport can
 detect missing punches on its own (chip may have died mid-race).
 
-### Manual OK (backup paper approval)
-For runners whose IOF XML status is `OK`, a follow-up `Result/Update` with
-`status='Ok'` is sent 20–60 minutes after purku. This simulates officials
-reviewing the runner's backup paper punch card and manually approving the
-result — which is how a runner with a dead chip still gets an `Ok` in the
-final results.
+### Hylkäysesitys → itkumuuri → manual OK (backup paper approval)
+
+For runners whose IOF XML status is `OK`, the simulation models the full
+real-world flow where a chip read may show missing punches:
+
+1. **Purku** — chip is downloaded; `status` is omitted so Navisport validates
+   the controls itself. Missing punches result in a temporary **hylkäysesitys**
+   (disqualification proposal) with `status=Dnf`.
+2. **Itkumuuri** — 5–15 minutes after purku the runner reaches the appeals desk.
+   Officials verify the backup paper card.
+3. **Manual OK** — 5–45 minutes after itkumuuri, officials approve the result.
+   A `Result/Update` with `status='Ok'` is sent.
 
 The full post-finish timeline for an OK runner:
 
 ```
-finish punch       → Passing/Update + Result/Update(finishTime, status=Finished)
-+ 10–15 min purku  → Result/Update(controlTimes)   — Navisport validates chip
-+ 20–60 min        → Result/Update(status=Ok)       — officials approve from paper
+finish punch          → Passing/Update + Result/Update(finishTime, status=Finished)
++ 10–15 min purku     → Result/Update(controlTimes)   — Navisport validates chip
++ 5–15 min itkumuuri  → itkumuuri event (hylkäysesitys, officials check paper)
++ 5–45 min manual_ok  → Result/Update(status=Ok)       — paper approved
 ```
+
+This flow applies to **all** OK runners with real chip data, reflecting the
+standard relay practice where backup papers are checked at the finish area.
+Runners whose IOF XML status is not `OK` (DNF, DSQ) go through a separate
+itkumuuri event without the manual_ok follow-up.
 
 ---
 
@@ -126,7 +138,7 @@ python3 simulator.py -i <iof.xml> [options]
 |------|---------|----------|
 | `-r` / `--team-range` | `"1,3,5,14-55"` | Include only teams whose bib is in the set/range |
 | `--limit-teams N` | `10` | Cap at the first N teams in XML order (applied after `--team-range`) |
-| `--legs N` | `1` | Only simulate the first N legs of each team |
+| `--legs SPEC` | — | Leg numbers to simulate, same syntax as `--team-range`: `"4"`, `"2-4"`, `"1,3"` |
 
 The two flags compose: `--team-range "101-200" --limit-teams 50` picks the
 first 50 teams with bib 101–200.

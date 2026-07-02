@@ -861,7 +861,7 @@ def parse_team_range(range_str: str) -> set[int]:
 # --- IOF XML parsing ---
 def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
                       team_limit: Optional[int] = None,
-                      max_legs: Optional[int] = None) -> List[Dict[str, Any]]:
+                      leg_set: Optional[set[int]] = None) -> List[Dict[str, Any]]:
     tree = ET.parse(iof_path)
     root = tree.getroot()
     ns_uri = root.tag.split('}')[0].strip('{') if '}' in root.tag else None
@@ -900,8 +900,19 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
             continue
 
         for idx, member in enumerate(members, start=1):
-            if max_legs and idx > max_legs:
-                break
+            # Resolve leg number from <Leg> element; fall back to enumerate index.
+            result_pre = member.find('iof:Result', ns)
+            leg_num = idx
+            if result_pre is not None:
+                leg_txt = result_pre.findtext('iof:Leg', namespaces=ns)
+                if leg_txt:
+                    try:
+                        leg_num = int(leg_txt)
+                    except ValueError:
+                        pass
+            if leg_set and leg_num not in leg_set:
+                continue
+
             person_id = None
             person_el = member.find('iof:Person', ns)
             if person_el is not None:
@@ -923,7 +934,7 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
             if not person_id:
                 person_id = f"{team_bib_text or 'team'}:{idx}"
 
-            result = member.find('iof:Result', ns)
+            result = result_pre
             if result is None:
                 continue
 
@@ -1562,8 +1573,8 @@ def main():
     p.add_argument('-r', '--team-range', help='Bib numbers to simulate, e.g., "1,3,5,14-55"')
     p.add_argument('--limit-teams', type=int, default=None,
                    help='Only process the first N teams (XML order, after --team-range filter)')
-    p.add_argument('--legs', type=int, default=None,
-                   help='Only simulate the first N legs of each team (e.g. --legs 1)')
+    p.add_argument('--legs', default=None,
+                   help='Leg numbers to simulate, e.g. "4" or "2-4" or "1,3"')
     p.add_argument('-m','--finish-control', type=str, help='Control code for finish punch, will be renamed to maali_1')
     p.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH,
                    help=f'Config file path (default: {DEFAULT_CONFIG_PATH})')
@@ -1625,8 +1636,16 @@ def main():
             print(e)
             return
 
+    leg_set = None
+    if args.legs:
+        try:
+            leg_set = parse_team_range(args.legs)
+        except ValueError as e:
+            print(f"Invalid --legs value: {e}")
+            return
+
     events = parse_iof3_events(args.iof, team_range=team_range,
-                               team_limit=args.limit_teams, max_legs=args.legs)
+                               team_limit=args.limit_teams, leg_set=leg_set)
     ws_info = "disabled (--no-ws)" if args.no_ws else f"{args.host}:{args.port}"
     print(f"Parsed {len(events)} events. Speed={args.speed} WS={ws_info}")
 
