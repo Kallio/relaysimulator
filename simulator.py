@@ -220,6 +220,23 @@ class NavisportSender:
                 if self._loop and self._debug_gate:
                     self._loop.call_soon_threadsafe(self._debug_gate.set)
 
+    # Maps IOF XML <Status> values to Navisport result status strings.
+    # 'OK' is deliberately left as None so Navisport validates the controls
+    # itself and sets the final status (Ok / Dnf / etc.) based on course data.
+    _IOF_STATUS_MAP: Dict[str, Optional[str]] = {
+        'ok':            None,    # let Navisport validate
+        'didnotfinish':  'Dnf',
+        'didnotstart':   'Dns',
+        'disqualified':  'Dsq',
+        'mp':            'Dnf',   # missing punch
+        'overtime':      'Dnf',
+    }
+
+    @classmethod
+    def _map_iof_status(cls, iof_status: str) -> Optional[str]:
+        """Return the Navisport status string for an IOF XML Status value, or None."""
+        return cls._IOF_STATUS_MAP.get((iof_status or '').lower())
+
     @staticmethod
     def _strip_nulls(d: dict) -> dict:
         return {k: v for k, v in d.items() if v is not None}
@@ -483,18 +500,52 @@ class NavisportSender:
             print(f"[navisport] purku: no valid punches for chip {chip}")
             return
 
+        iof_status = ev.get('runner_status')
+        navi_status = self._map_iof_status(iof_status) if iof_status else None
         chip_result = _build_chip_result(
             result_id=result['id'],
             event_id=self.event_id,
             controls=controls,
             start_time=start_time_str,
-            status=None,  # let Navisport validate controls and set status
+            status=navi_status,  # None for OK → Navisport validates; explicit for DNF/DNS/DSQ
         )
         chip_result['readTime'] = purku_ts
+        status_info = f"  iof={iof_status}→navi={navi_status or '(Navisport validates)'}"
         self._send_result(chip_result, self.event_id,
-                          f"Result/Update [purku]  chip={chip}  punches={len(controls)}  "
-                          f"startTime={start_time_str}")
-        print(f"[navisport] purku: sent {len(controls)} punches for chip {chip}")
+                          f"Result/Update [purku]  chip={chip}  punches={len(controls)}"
+                          f"  startTime={start_time_str}{status_info}")
+        print(f"[navisport] purku: sent {len(controls)} punches for chip {chip}"
+              f"  status: {iof_status}→{navi_status or '(Navisport validates)'}")
+
+    def _sync_send_manual_ok(self, ev: Dict, timestamp: str):
+        """Send Result/Update with status='Ok' — simulates officials approving from paper backup."""
+        if not self._conn:
+            return
+        event_data = self._conn.get_event(self.event_id)
+        if not event_data:
+            return
+        chip = self._resolve_chip(ev)
+        result = next(
+            (r for r in event_data.get('results', [])
+             if str(r.get('chip', '')) == chip or str(r.get('secondaryChip', '')) == chip),
+            None,
+        )
+        if not result:
+            print(f"[navisport] manual_ok: no result for chip {chip}")
+            return
+        updated = {
+            **result,
+            'status': 'Ok',
+            'updated': _navi_now_iso(),
+        }
+        self._send_result(updated, self.event_id,
+                          f"Result/Update [manual_ok]  chip={chip}  status=Ok  "
+                          f"(officials approved from backup paper)")
+        print(f"[navisport] manual_ok: set status=Ok for chip {chip}")
+
+    # ------------------------------------------------------------------
+    # Async entry points called from schedule_and_send
+    # ------------------------------------------------------------------
 
     async def on_event(self, event: Dict[str, Any], sent_ts: str, msg_obj: Optional[Dict[str, Any]] = None):
         if not self._conn:
@@ -516,6 +567,9 @@ class NavisportSender:
             # Use shifted punches from msg_obj (timestamps already adjusted for sim speed)
             punches = (msg_obj or {}).get('punches', event.get('punches', []))
             await loop.run_in_executor(None, self._sync_send_purku, event, punches, sent_ts)
+
+        elif etype == 'manual_ok':
+            await loop.run_in_executor(None, self._sync_send_manual_ok, event, sent_ts)
 
     async def close(self):
         if self._refresh_task:
@@ -1182,6 +1236,7 @@ async def run_simulator(events: List[Dict[str, Any]],
                 'runner_id': runner,
                 'team_id': first_punch.get('team_id'),
                 'leg': first_punch.get('leg'),
+                'runner_status': first_punch.get('status'),  # IOF XML status: OK/DidNotFinish/DidNotStart/Disqualified
                 'device_id': random.choice(PURKU_DEVICES),
                 'device_type': 'results_purku',
                 'event': 'results_purku',
@@ -1191,12 +1246,26 @@ async def run_simulator(events: List[Dict[str, Any]],
             }
             extra_events.append((purku_ts, purku_event))
 
+            iof_runner_status = first_punch.get('status') or ''
+
+            # manual_ok — officials approve the result from backup paper for OK runners
+            # Simulates the case where the chip died mid-race but paper punches are OK.
+            if iof_runner_status.upper() == 'OK':
+                ok_delay = random.randint(20, 60)
+                ok_ts = purku_ts + timedelta(minutes=ok_delay)
+                extra_events.append((ok_ts, {
+                    'timestamp': ok_ts.isoformat(),
+                    'runner_id': runner,
+                    'team_id': first_punch.get('team_id'),
+                    'leg': first_punch.get('leg'),
+                    'device_id': 'officials',
+                    'device_type': 'manual_ok',
+                    'event': 'manual_ok',
+                    'note': f'manual OK {ok_delay}min after purku (backup paper)',
+                }))
+
             # itkumuuri (DQ appeal desk)
-            runner_status = None
-            for _, e in evs_sorted:
-                if e.get('status'):
-                    runner_status = e['status']
-                    break
+            runner_status = iof_runner_status or None
             if runner_status and runner_status not in ("OK", "Finished"):
                 itkumuuri_delay = random.randint(5, 60)
                 itkumuuri_ts = purku_ts + timedelta(minutes=itkumuuri_delay)

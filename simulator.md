@@ -32,7 +32,7 @@ interactive debug confirmation.
 └──────────────────────┼────────────────────────┼──────────────────┘
                        ▼                        ▼
               Real Navisport server      listener.py
-                (option to local)      (WebSocket /sim)
+              (Socket.IO on port 80)     (WebSocket /sim)
 ```
 
 Two independent output paths run in parallel by default. Either can be
@@ -66,15 +66,45 @@ Sends a `Passing/Update` with:
   this to link the passing to the correct result
 
 ### Finish punch
+Detected when the checkpoint's Navisport `type` is `Finish`, or when
+`device_type` is `finish`, or when the control code is one of
+`maali` / `finish` / `f`. The finish checkpoint must have a timing device
+attached — the simulator aborts at connect time if it does not.
+
 Sends the `Passing/Update` as above, then immediately sends a `Result/Update`
 with `finishTime`, `finishTimeSource=Timing device`, `status=Finished`, and
 the total elapsed time.
 
 ### Purku (chip dump)
-After the finish, the runner's chip is read at the download station.
-Sends a full `Result/Update` via `build_chip_result` with all split times
-as `controlTimes`. `status` is omitted so Navisport validates the controls
-against the course and sets the status itself.
+Scheduled 10–15 minutes after the runner's last punch. Sends a full
+`Result/Update` via `build_chip_result` with all split times as
+`controlTimes`. The `status` field depends on the runner's IOF XML
+`<Status>`:
+
+| IOF XML `<Status>` | Navisport `status` sent | Effect |
+|---|---|---|
+| `OK` | *(omitted)* | Navisport validates controls and sets status itself |
+| `DidNotFinish` | `Dnf` | Navisport records DNF |
+| `DidNotStart` | `Dns` | Navisport records DNS |
+| `Disqualified` | `Dsq` | Navisport records DSQ |
+
+For `OK` runners, `status` is intentionally omitted so Navisport can
+detect missing punches on its own (chip may have died mid-race).
+
+### Manual OK (backup paper approval)
+For runners whose IOF XML status is `OK`, a follow-up `Result/Update` with
+`status='Ok'` is sent 20–60 minutes after purku. This simulates officials
+reviewing the runner's backup paper punch card and manually approving the
+result — which is how a runner with a dead chip still gets an `Ok` in the
+final results.
+
+The full post-finish timeline for an OK runner:
+
+```
+finish punch       → Passing/Update + Result/Update(finishTime, status=Finished)
++ 10–15 min purku  → Result/Update(controlTimes)   — Navisport validates chip
++ 20–60 min        → Result/Update(status=Ok)       — officials approve from paper
+```
 
 ---
 
@@ -96,6 +126,7 @@ python3 simulator.py -i <iof.xml> [options]
 |------|---------|----------|
 | `-r` / `--team-range` | `"1,3,5,14-55"` | Include only teams whose bib is in the set/range |
 | `--limit-teams N` | `10` | Cap at the first N teams in XML order (applied after `--team-range`) |
+| `--legs N` | `1` | Only simulate the first N legs of each team |
 
 The two flags compose: `--team-range "101-200" --limit-teams 50` picks the
 first 50 teams with bib 101–200.
@@ -239,10 +270,33 @@ decide without reading the full JSON every time:
 - `Result/Update [new Individual]` / `[new Team]` — fresh registration
 - `Passing/Update` — intermediate control punch
 - `Result/Update [finish]` — finish time update
-- `Result/Update [purku]` — full chip dump
+- `Result/Update [purku]` — full chip dump with split times
+- `Result/Update [manual_ok]` — officials approved result from backup paper
 
-Because events run concurrently (multiple runners in flight), a lock
-serialises all prompts so only one appears at a time.
+The simulation is fully paused while a prompt is displayed — the asyncio
+scheduler does not advance to the next event until you answer. This means
+you see one event at a time in strict chronological order, never a backlog
+of queued prompts.
+
+---
+
+## Navisport checkpoint requirements
+
+At connect time the simulator fetches the checkpoint list from Navisport
+(via `Event/Select`, with up to 3 retries). It then:
+
+1. Builds a lookup map keyed by control `code` (integer or string). For
+   checkpoints that have no numeric code, the `name` field is used as the
+   key instead.
+2. Prints the full checkpoint table so you can verify codes and device
+   assignments before the simulation starts.
+3. **Aborts immediately** if:
+   - No checkpoint of type `Finish` is found for the event.
+   - A `Finish` checkpoint exists but has no timing device attached.
+
+Punches for unknown control codes are silently skipped (one warning per
+code). If new checkpoints are added to Navisport mid-simulation they are
+picked up automatically on the next 5-minute cache refresh.
 
 ---
 
@@ -390,4 +444,9 @@ without a live Navisport instance.
 - [ ] `pip install -r requirements.txt`
 - [ ] `navisport_register.py` in the same directory (imported by simulator)
 - [ ] IOF3 XML file with `<SplitTime>` elements
-- [ ] For Navisport mode: Navisport desktop app running with event loaded and checkpoints configured
+- [ ] For Navisport mode:
+  - Navisport desktop app running with the target event loaded
+  - At least one checkpoint of type **Finish** configured for the event
+  - The Finish checkpoint must have a **timing device** attached
+  - Intermediate control checkpoints configured with the same codes as in
+    the IOF XML (missing codes are skipped with a warning)
