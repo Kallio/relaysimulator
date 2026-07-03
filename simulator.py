@@ -978,7 +978,7 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
                         'raw_time': time_txt,
                         'status': status_txt or 'OK',
                         'event': 'punch',
-                        'leg': idx,
+                        'leg': leg_num,
                         'start_time': start_dt.isoformat() if start_dt else None,
                     })
 
@@ -997,7 +997,7 @@ def parse_iof3_events(iof_path: str, team_range: Optional[set[int]] = None,
                     'device_type': 'status_only',
                     'status': status_txt,
                     'event': 'status_only',
-                    'leg': idx,
+                    'leg': leg_num,
                     'start_time': start_dt.isoformat() if start_dt else None,
                 })
 
