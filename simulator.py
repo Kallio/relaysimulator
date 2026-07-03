@@ -47,6 +47,7 @@ class NavisportSender:
         self._start_times: Dict[str, str] = {}   # runner_id → ISO start timestamp
         self._result_ids: Dict[str, str] = {}    # chip → result_id
         self._unknown_codes: set = set()          # codes warned about already
+        self._purku_validated: set = set()        # chips whose purku was validated by Navisport (status=Finished)
         self._debug = debug
         self._debug_lock = threading.Lock()       # serialise interactive prompts
         self._debug_gate: Optional[asyncio.Event] = None  # asyncio gate: cleared while a prompt is shown
@@ -543,6 +544,24 @@ class NavisportSender:
         print(f"[navisport] purku: sent {len(controls)} punches for chip {chip}"
               f"  status: {iof_status}→{navi_status or '(Navisport validates)'}")
 
+        # Check whether Navisport accepted all punches (status → Finished).
+        # Validated runners need no manual intervention; non-validated runners
+        # (missing punches) proceed to itkumuuri + manual_ok training scenario.
+        try:
+            import time as _time
+            _time.sleep(0.5)  # brief pause so Navisport can finish processing
+            refreshed = self._conn.get_event(self.event_id)
+            if refreshed:
+                refreshed_result = self._find_result(ev, refreshed.get('results', []))
+                navi_result_status = (refreshed_result.get('status') or '').lower() if refreshed_result else ''
+                if navi_result_status in ('finished', 'ok'):
+                    self._purku_validated.add(chip)
+                    print(f"[navisport] purku: chip={chip} Navisport status='{navi_result_status}' → all punches OK, no manual_ok needed")
+                else:
+                    print(f"[navisport] purku: chip={chip} Navisport status='{navi_result_status}' → missing punches, itkumuuri + manual_ok will follow")
+        except Exception as _e:
+            print(f"[navisport] purku: validation check failed for chip={chip}: {_e}")
+
     def _sync_send_status_update(self, ev: Dict, timestamp: str):
         """Send Result/Update with the IOF status for runners who have no chip data (DNS/DNF/DSQ)."""
         if not self._conn:
@@ -570,13 +589,25 @@ class NavisportSender:
         print(f"[navisport] status_update: chip={chip}  {iof_status}→{navi_status}")
 
     def _sync_send_manual_ok(self, ev: Dict, timestamp: str):
-        """Send Result/Update with status='Ok' — simulates officials approving from paper backup."""
+        """Send Result/Update with status='Ok' — simulates officials approving from paper backup.
+
+        Fires ONLY for runners whose purku was NOT fully validated by Navisport
+        (i.e. Navisport set Mispunch/Competing because punches were missing).
+        These runners go through the itkumuuri process and officials manually approve
+        from the paper backup — the training scenario.
+
+        Runners whose purku was validated (Navisport set Finished automatically) do not
+        need a manual override and are skipped here.
+        """
         if not self._conn:
+            return
+        chip = self._resolve_chip(ev)
+        if chip in self._purku_validated:
+            print(f"[navisport] manual_ok: skipped for chip={chip} (bib={ev.get('team_id')} leg={ev.get('leg')}) — Navisport already validated (Finished), no manual override needed")
             return
         event_data = self._conn.get_event(self.event_id)
         if not event_data:
             return
-        chip = self._resolve_chip(ev)
         result = self._find_result(ev, event_data.get('results', []))
         if not result:
             print(f"[navisport] manual_ok: no result for chip {chip} (bib={ev.get('team_id')} leg={ev.get('leg')})")

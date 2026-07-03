@@ -93,30 +93,47 @@ detect missing punches on its own (chip may have died mid-race).
 
 ### Hylkäysesitys → itkumuuri → manual OK (backup paper approval)
 
-For runners whose IOF XML status is `OK`, the simulation models the full
-real-world flow where a chip read may show missing punches:
+After purku the simulator re-fetches the result from Navisport (~0.5 s after
+the send) to see whether Navisport accepted all punches. This drives two
+different post-finish paths:
+
+**Path A — clean chip dump (Navisport validates all punches → `Finished`):**
+
+No manual intervention is needed. The runner is done.
+
+```
+finish punch       → Passing/Update + Result/Update(finishTime, status=Finished)
++ 10–15 min purku  → Result/Update(controlTimes) — Navisport validates, sets Finished
+```
+
+**Path B — missing punches (Navisport sets `Mispunch` / `Competing`):**
+
+The training scenario. Officials must verify the backup paper card and manually
+approve the result:
 
 1. **Purku** — chip is downloaded; `status` is omitted so Navisport validates
-   the controls itself. Missing punches result in a temporary **hylkäysesitys**
-   (disqualification proposal) with `status=Dnf`.
-2. **Itkumuuri** — 5–15 minutes after purku the runner reaches the appeals desk.
-   Officials verify the backup paper card.
+   the controls itself. Missing punches result in a **hylkäysesitys**
+   (disqualification proposal).
+2. **Itkumuuri** — 5–15 minutes after purku the runner reaches the appeals
+   desk. This is a WebSocket-only event (no Navisport action); it simulates
+   officials checking the backup paper card.
 3. **Manual OK** — 5–45 minutes after itkumuuri, officials approve the result.
-   A `Result/Update` with `status='Ok'` is sent.
-
-The full post-finish timeline for an OK runner:
+   A `Result/Update` with `status='Ok'` is sent to Navisport.
 
 ```
 finish punch          → Passing/Update + Result/Update(finishTime, status=Finished)
-+ 10–15 min purku     → Result/Update(controlTimes)   — Navisport validates chip
-+ 5–15 min itkumuuri  → itkumuuri event (hylkäysesitys, officials check paper)
-+ 5–45 min manual_ok  → Result/Update(status=Ok)       — paper approved
++ 10–15 min purku     → Result/Update(controlTimes) — Navisport sets Mispunch
++ 5–15 min itkumuuri  → WebSocket event only (officials check paper)
++ 5–45 min manual_ok  → Result/Update(status=Ok)   — paper approved
 ```
 
-This flow applies to **all** OK runners with real chip data, reflecting the
-standard relay practice where backup papers are checked at the finish area.
-Runners whose IOF XML status is not `OK` (DNF, DSQ) go through a separate
-itkumuuri event without the manual_ok follow-up.
+Path B applies when the IOF XML says `OK` but Navisport finds missing punches —
+the most common cause being that the Navisport event has no checkpoints
+configured for some of the runner's control codes.
+
+Runners whose IOF XML status is not `OK` (DNF, DSQ) get an itkumuuri event
+(5–60 minutes after their last event) without a manual_ok follow-up.
+DNS runners do not go to itkumuuri.
 
 ---
 
