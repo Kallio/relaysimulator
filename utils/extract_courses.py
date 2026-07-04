@@ -70,7 +70,7 @@ def parse_radat(radat_path):
             if len(parts) < 4:
                 continue
 
-            m = re.match(r"ju\((\w+)\)", parts[2])
+            m = re.match(r"(?:ju|ve)\((\w+)\)", parts[2])
             if not m:
                 continue
             course_name = m.group(1)
