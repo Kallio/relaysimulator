@@ -3,10 +3,6 @@ import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
-IMG_W = 2324
-IMG_H = 3220
-
-
 def infer_leg_from_course_name(name):
     """
     Päätellään osuuden numero kurssin nimen perusteella.
@@ -39,15 +35,16 @@ def parse_georef(georef_str):
     return [(floats[i], floats[i + 1]) for i in range(0, 8, 2)]
 
 
-def pixel_to_latlon(px, py_neg, corners):
+def pixel_to_latlon(px, py_neg, corners, img_w=2324, img_h=3220):
     """
     Bilinear interpolation: radat pixel coords -> WGS84.
     px: x pixels from left edge (0 = left)
     py_neg: y as stored in radat (negative means below top)
     corners: [NW, NE, SE, SW] as (lat, lon)
+    img_w, img_h: image dimensions in pixels
     """
-    u = max(0.0, min(1.0, px / (IMG_W - 1)))
-    v = max(0.0, min(1.0, (-py_neg) / (IMG_H - 1)))
+    u = max(0.0, min(1.0, px / (img_w - 1)))
+    v = max(0.0, min(1.0, (-py_neg) / (img_h - 1)))
     (lat_NW, lon_NW), (lat_NE, lon_NE), (lat_SE, lon_SE), (lat_SW, lon_SW) = corners
     lat = (1-u)*(1-v)*lat_NW + u*(1-v)*lat_NE + u*v*lat_SE + (1-u)*v*lat_SW
     lon = (1-u)*(1-v)*lon_NW + u*(1-v)*lon_NE + u*v*lon_SE + (1-u)*v*lon_SW
@@ -86,9 +83,9 @@ def parse_radat(radat_path):
                 if not tokens or not tokens[0]:
                     continue
                 t = tokens[0]
-                if t == "2" and len(tokens) >= 6 and start is None:
+                if t == "2" and len(tokens) >= 3 and start is None:
                     start = (float(tokens[1]), float(tokens[2]))
-                elif t == "1" and len(tokens) >= 6:
+                elif t == "1" and len(tokens) >= 3:
                     type1.append((float(tokens[1]), float(tokens[2])))
 
             control_positions[course_name] = type1
@@ -98,7 +95,7 @@ def parse_radat(radat_path):
     return control_positions, start_positions
 
 
-def resultlist_to_coursedata(iof_in, courses_out, radat_file=None, georef=None):
+def resultlist_to_coursedata(iof_in, courses_out, radat_file=None, georef=None, img_w=2324, img_h=3220):
     tree = ET.parse(iof_in)
     root = tree.getroot()
     ns_uri = root.tag.split('}')[0].strip('{')
@@ -178,13 +175,13 @@ def resultlist_to_coursedata(iof_in, courses_out, radat_file=None, georef=None):
             for i, code in enumerate(codes):
                 if i < len(positions):
                     px, py_neg = positions[i]
-                    lat, lon = pixel_to_latlon(px, py_neg, corners)
+                    lat, lon = pixel_to_latlon(px, py_neg, corners, img_w, img_h)
                     geo_pts.setdefault(code, []).append((lat, lon))
                     map_pts.setdefault(code, []).append((px, py_neg))
 
         # S1 start position averaged over all course starts
         for cname, (px, py_neg) in radat_start.items():
-            lat, lon = pixel_to_latlon(px, py_neg, corners)
+            lat, lon = pixel_to_latlon(px, py_neg, corners, img_w, img_h)
             geo_pts.setdefault("S1", []).append((lat, lon))
             map_pts.setdefault("S1", []).append((px, py_neg))
 
@@ -221,7 +218,7 @@ def resultlist_to_coursedata(iof_in, courses_out, radat_file=None, georef=None):
         tl = ET.SubElement(map_el, "MapPositionTopLeft")
         tl.set("x", "0"); tl.set("y", "0"); tl.set("unit", "px")
         br = ET.SubElement(map_el, "MapPositionBottomRight")
-        br.set("x", str(IMG_W)); br.set("y", str(IMG_H)); br.set("unit", "px")
+        br.set("x", str(img_w - 1)); br.set("y", str(img_h - 1)); br.set("unit", "px")
 
     # Control elements: S1 + all split-time codes
     all_codes = {"S1"}
@@ -262,7 +259,7 @@ def resultlist_to_coursedata(iof_in, courses_out, radat_file=None, georef=None):
         for i, code in enumerate(controls):
             if i < len(positions) and corners:
                 px, py_neg = positions[i]
-                ctrl_geos.append(pixel_to_latlon(px, py_neg, corners))
+                ctrl_geos.append(pixel_to_latlon(px, py_neg, corners, img_w, img_h))
             else:
                 ctrl_geos.append(avg_geo(code))
 
@@ -334,11 +331,13 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--iof", required=True, help="ResultList IOF XML")
     p.add_argument("--out", required=True, help="CourseData.xml output")
-    p.add_argument("--radat", help="radat_73.txt course overlay file")
+    p.add_argument("--radat", help="radat_73.txt course overlay file e.g. from  curl -o radat_73.txt  https://routegadget.jukola.com/kartat/radat_73.txt")
     p.add_argument(
         "--georef",
         default="66_61.652565_27.122711_61.644249_27.204894_61.590181_27.180791_61.598512_27.098436",
         help="Georef: id_latNW_lonNW_latNE_lonNE_latSE_lonSE_latSW_lonSW"
     )
+    p.add_argument("--img-w", type=int, default=2324, help="Image width in pixels (default: 2324)")
+    p.add_argument("--img-h", type=int, default=3220, help="Image height in pixels (default: 3220)")
     args = p.parse_args()
-    resultlist_to_coursedata(args.iof, args.out, radat_file=args.radat, georef=args.georef)
+    resultlist_to_coursedata(args.iof, args.out, radat_file=args.radat, georef=args.georef, img_w=args.img_w, img_h=args.img_h)
