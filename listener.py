@@ -2,29 +2,52 @@
 """
 Combined WebSocket + Socket.IO server for simulator testing.
 
-Serves two protocols on the same port:
+Serves three protocols on the same port:
 
-  1. WebSocket at /sim   — receives JSON messages from simulator.py DeviceClient
-                           (login events, punches, purkus).  Used with:
-                             simulator.py -P <PORT> --speed 10 --login-only
+  1. WebSocket at /sim  — receives JSON messages from simulator.py DeviceClient
+                          (login events, punches, purkus).  Used with:
+                            simulator.py -P <PORT> --speed 10 --login-only
 
-  2. Socket.IO at /      — mimics the Navisport desktop app API
-                           (Event/Select, Result/Update, Passing/Update).
-                           Used with:
-                             simulator.py --navisport http://127.0.0.1:<PORT>
-                                          --navisport-event-id <uuid>
+  2. WebSocket at /ws   — dashboard clients (dashboard.html). Receives periodic
+                          stats broadcasts aggregated from /sim messages.
+
+  3. Socket.IO at /     — mimics the Navisport desktop app API
+                          (Event/Select, Result/Update, Passing/Update).
+                          Used with:
+                            simulator.py --navisport http://127.0.0.1:<PORT>
+                                         --navisport-event-id <uuid>
+
+  4. HTTP /             — serves dashboard.html
+
+  5. HTTP /health       — JSON health check
 
 Usage:
   python3 listener.py [--port PORT]
 """
 import argparse
+import asyncio
 import json
+import resource
 import signal
 import uuid
 from datetime import datetime, timezone
 
 import socketio
-from aiohttp import web
+from aiohttp import web, WSMsgType
+
+# ---------------------------------------------------------------------------
+# Resource limits — prevent "Too many open files" during large simulations
+# ---------------------------------------------------------------------------
+HOST = '0.0.0.0'
+DESIRED_FD_LIMIT = 4096
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if soft < DESIRED_FD_LIMIT:
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(DESIRED_FD_LIMIT, hard), hard))
+        print(f"Raised open-file limit to {min(DESIRED_FD_LIMIT, hard)}")
+    except Exception as e:
+        print(f"Warning: could not raise open-file limit ({soft} < {DESIRED_FD_LIMIT}): {e}")
+print(f"Max open files: {resource.getrlimit(resource.RLIMIT_NOFILE)[0]}")
 
 # ---------------------------------------------------------------------------
 # Checkpoint data — from real Navisport desktop app list-checkpoints output
@@ -60,9 +83,20 @@ CP_NAME_BY_ID = {cp['id']: f"{cp.get('name','?')} ({cp.get('type','?')})" for cp
 # ---------------------------------------------------------------------------
 results_store: list = []
 passing_count = 0
-ws_message_count = 0
 _chips_seen: set = set()
 _current_event_id: str = ''
+
+# Dashboard / simulator stats (compatible with dashboard.html + server_ws.py)
+stats = {
+    'connections': 0,
+    'messages': 0,
+    'by_device': {},
+    'by_type': {},
+    'last': None,
+}
+
+dashboards: set[web.WebSocketResponse] = set()
+simulators: set[web.WebSocketResponse] = set()
 
 # ---------------------------------------------------------------------------
 # Socket.IO + aiohttp
@@ -153,56 +187,130 @@ def _handle_result_update(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint (/sim)
+# WebSocket: simulator clients (/sim)
 # ---------------------------------------------------------------------------
 
-async def websocket_handler(request):
-    global ws_message_count
+async def ws_sim_handler(request):
+    global stats
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    print(f"[ws] Client connected: {request.remote}")
+    simulators.add(ws)
+    stats['connections'] += 1
+    print(f"[ws] Simulator connected: {request.remote}")
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                stats['messages'] += 1
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    print(f"[ws] Raw: {msg.data}")
+                    continue
 
-    async for msg in ws:
-        if msg.type == web.WSMsgType.TEXT:
-            try:
-                data = json.loads(msg.data)
-            except json.JSONDecodeError:
-                print(f"[ws] Raw: {msg.data}")
-                continue
+                ev = data.get('event', '?')
+                rid = data.get('runner_id', '?')
+                dev = data.get('device_id', '?')
+                ts  = data.get('timestamp', '?')
+                note = data.get('note', '')
+                print(f"[ws] #{stats['messages']} [{ev:15s}] runner={rid:25s}  "
+                      f"device={dev:10s}  ts={ts}")
+                if note:
+                    print(f"     note: {note}")
 
-            ws_message_count += 1
-            ev = data.get('event', '?')
-            rid = data.get('runner_id', '?')
-            dev = data.get('device_id', '?')
-            ts = data.get('timestamp', '?')
-            note = data.get('note', '')
-            print(f"[ws] #{ws_message_count} [{ev:15s}] runner={rid:25s}  "
-                  f"device={dev:10s}  ts={ts}")
-            if note:
-                print(f"     note: {note}")
-        elif msg.type == web.WSMsgType.ERROR:
-            break
+                # Track per-device and per-type counts
+                stats['by_device'][dev] = stats['by_device'].get(dev, 0) + 1
+                stats['by_type'][ev]    = stats['by_type'].get(ev, 0) + 1
+                stats['last'] = data
 
-    print(f"[ws] Client disconnected: {request.remote}")
+                # If this is a mass_start event, broadcast it immediately to dashboards
+                if ev == 'mass_start':
+                    broadcast = json.dumps({
+                        'type': 'mass_start',
+                        'timestamp': ts,
+                        'group': data.get('group', ''),
+                    })
+                    dead: list[web.WebSocketResponse] = []
+                    for d in dashboards:
+                        try:
+                            await d.send_str(broadcast)
+                        except Exception:
+                            dead.append(d)
+                    for d in dead:
+                        dashboards.discard(d)
+            elif msg.type == WSMsgType.ERROR:
+                print(f"[ws] Simulator WS error: {ws.exception()}")
+    finally:
+        simulators.discard(ws)
+        stats['connections'] -= 1
+    print(f"[ws] Simulator disconnected: {request.remote}")
     return ws
 
 
-app.router.add_get('/sim', websocket_handler)
+# ---------------------------------------------------------------------------
+# WebSocket: dashboard clients (/ws)
+# ---------------------------------------------------------------------------
+
+async def ws_dashboard_handler(request):
+    ws = web.WebSocketResponse(max_msg_size=10*1024*1024)
+    await ws.prepare(request)
+    dashboards.add(ws)
+    print(f"[ws] Dashboard connected: {request.remote}")
+    try:
+        # Send init snapshot immediately
+        await ws.send_str(json.dumps({'type': 'init', 'stats': stats}))
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                pass  # dashboard doesn't send meaningful data
+    finally:
+        dashboards.discard(ws)
+    return ws
+
 
 # ---------------------------------------------------------------------------
-# HTTP endpoint
+# Broadcast loop — push stats to all dashboards every 1s
 # ---------------------------------------------------------------------------
+
+async def broadcast_loop():
+    while True:
+        if dashboards:
+            if stats['last'] is not None:
+                update = json.dumps({'type': 'update', 'stats': stats})
+                dead: list[web.WebSocketResponse] = []
+                for d in dashboards:
+                    try:
+                        await d.send_str(update)
+                    except Exception:
+                        dead.append(d)
+                for d in dead:
+                    dashboards.discard(d)
+        await asyncio.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoints
+# ---------------------------------------------------------------------------
+
+async def index(request):
+    return web.FileResponse('dashboard.html')
+
 
 async def health(request):
     return web.json_response({
-        'status': 'ok', 'passings': passing_count,
+        'status': 'ok',
+        'passings': passing_count,
         'results': len(results_store),
         'checkpoints': len(CHECKPOINTS),
-        'ws_messages': ws_message_count,
+        'ws_messages': stats['messages'],
+        'ws_connections': stats['connections'],
+        'simulators': len(simulators),
+        'dashboards': len(dashboards),
     })
 
-app.router.add_get('/health', health)
 
+app.router.add_get('/', index)
+app.router.add_get('/ws', ws_dashboard_handler)
+app.router.add_get('/sim', ws_sim_handler)
+app.router.add_get('/health', health)
 
 # ---------------------------------------------------------------------------
 # Socket.IO event handlers
@@ -275,6 +383,22 @@ async def handle_message(sid, data):
 
 
 # ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
+
+async def on_startup(app):
+    app['broadcast_task'] = asyncio.create_task(broadcast_loop())
+
+
+async def on_cleanup(app):
+    app['broadcast_task'].cancel()
+    await asyncio.gather(app['broadcast_task'], return_exceptions=True)
+
+
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -285,17 +409,19 @@ def main():
                    help='Listen port (default 8080)')
     args = p.parse_args()
 
-    print(f"[listener] Starting combined server on 0.0.0.0:{args.port}")
-    print(f"[listener]   WebSocket /sim     — for simulator DeviceClient")
-    print(f"[listener]   Socket.IO /        — Navisport-mock protocol")
-    print(f"[listener]   HTTP     /health   — health check")
+    print(f"[listener] Starting combined server on {HOST}:{args.port}")
+    print(f"[listener]   HTTP      /        — dashboard.html")
+    print(f"[listener]   WebSocket /ws     — dashboard clients")
+    print(f"[listener]   WebSocket /sim    — simulator DeviceClient")
+    print(f"[listener]   Socket.IO /       — Navisport-mock protocol")
+    print(f"[listener]   HTTP      /health — health check")
     print(f"[listener] Checkpoints loaded: {len(CHECKPOINTS)}")
     for cp in CHECKPOINTS:
         devs = ', '.join(cp['devices']) if cp['devices'] else '-'
         print(f"  {cp['type']:12s} {cp['name']:6s}  id={cp['id']}  devices={devs}")
     print()
 
-    web.run_app(app, host='0.0.0.0', port=args.port, print=lambda *a: None)
+    web.run_app(app, host=HOST, port=args.port, backlog=4096, print=lambda *a: None)
 
 
 if __name__ == '__main__':
