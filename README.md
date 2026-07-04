@@ -1,47 +1,38 @@
 # relaysimulator
 
-Simulates relay race events in real time, with results streamed over WebSockets.
-The long-term goal is to provide data directly consumable by **Navisport**, but **this branch does not yet include Navisport hooks**.
-
----
-
-## Table of Contents
-
-* [What is it](#what-is-it)
-* [Features](#features)
-* [Quick Start](#quick-start)
-* [WebSocket Output](#websocket-output)
-* [Navisport Integration](#navisport-integration)
-* [Development Notes](#development-notes)
-* [Limitations](#limitations)
-* [Contributing](#contributing)
-* [License](#license)
-
----
-
-## What is it?
-
-`relaysimulator` replays real relay events from official IOF XML result files, generating live-like updates as if the race were happening again.
+Simulates relay race events in real time, replaying IOF3 XML result files as
+live-like updates over WebSockets or directly to a **Navisport** desktop
+instance.
 
 Use cases include:
 
 * Testing dashboards or visualizations without a live competition.
-* Developing integrations for platforms such as **Navisport**.
+* Developing and debugging Navisport integration workflows.
 * Demonstrating event flow and data handling.
 
----
-
-## Features
-
-* Reads IOF XML relay result files.
-* Simulates progress of teams and legs in real time or at configurable speeds.
-* Broadcasts updates to connected clients via WebSocket.
-* Example dashboards (HTML/JS) for visualizing results.
-* Data conversion utilities exist (e.g. `iof_to_navisport.py`), but **direct Navisport output is not yet implemented**.
+* [simulator.md](simulator.md) — architecture, CLI reference, usage modes,
+  Navisport integration details, listener.py, check-in queue simulation
+* [protocol.md](protocol.md) *(if it exists)* — WebSocket message schema
 
 ---
 
-## Quick Start
+## Quick reference
+
+| Task | Command |
+|------|---------|
+| Install | `pip install -r requirements.txt` |
+| Convert IOF XML → Navisport CSV | `python utils/iof_to_navisport.py --iof <file> --out <csv>` |
+| Simulate (Navisport only) | `python simulator.py -i <file> --navisport <url> --navisport-event-id <uuid> --speed 2 --no-ws` |
+| Simulate (WS only) | `python simulator.py -i <file> -P 8080 --speed 2` |
+| Mock listener | `python listener.py --port 8080` |
+
+See [simulator.md](simulator.md) for the full CLI reference, usage modes
+(A–D), the `--debug-navisport` walkthrough, checkpoint requirements,
+and relay-race specifics.
+
+---
+
+## Getting Started
 
 1. **Install dependencies**
 
@@ -51,62 +42,80 @@ Use cases include:
    pip install -r requirements.txt
    ```
 
-2. **Prepare IOF XML results**
+2. **Get IOF XML data**
 
-   * Place your IOF XML files in a folder called `data/` inside the project directory.
-   * Make sure the file is **valid IOF XML** (e.g., from Venla, Jukola, or another official event).
-   * Fetch data for simulation from: 
-    ```bash
-    YEAR="2025"  # Set the year here
-    TYPE="ju"    # Set to "ju" for juniors or "ve" for veterans
-    mkdir data
-    curl -o data/results_j${YEAR}_${TYPE}_iof.xml https://results.jukola.com/tulokset/results_j${YEAR}_${TYPE}_iof.xml
-    ```
-    * fix the data. At least jukola relay 2025 contains wrong walues! 
-    ```bash
-    python fix_jukola_xml_date_values.py results_j2025_ju_iof.xml > results_j2025_ju_iof_fixed.xml
-    ```
-
-
-
-   * Example folder structure:
-
-     ```
-     relaysimulator/
-     ├─ simulator.py
-     ├─ server_ws.py
-     ├─ dashboard.html
-     └─ data/
-         ├─ results_j2025_ve_iof.xml
-         └─ results_j2025_ju_iof.xml
-         └─ results_j2025_ju_iof_fixed.xml 
-     ```
-   * Use the full path when running the simulator, e.g.:
-
-     ```bash
-     python simulator.py --iof data/results_j2025_ju_iof_fixed.xml --speed 2
-     ```
-
-3. **Run the WebSocket server**
-
+   Fetch e.g. Jukola 2025 veterans results:
    ```bash
-   python server_ws.py
+   mkdir -p data
+   curl -o data/results_j2025_ve_iof.xml \
+     https://results.jukola.com/tulokset/results_j2025_ve_iof.xml
+   ```
+   The official XML sometimes has wrong date values — fix if needed:
+   ```bash
+   python utils/fix_jukola_xml_date_values.py \
+     data/results_j2025_ve_iof.xml \
+     data/results_j2025_ve_iof_fixed.xml
    ```
 
-4. **Start the simulator**
+3. **Start the mock listener** (for WebSocket mode)
 
    ```bash
-   python simulator.py --iof data/results_j2025_ve_iof.xml --speed 2
+   python listener.py --port 8080
    ```
 
-5. **Connect a dashboard**
-   Open `dashboard.html` in a browser — it connects to the WebSocket and visualizes the race in real time.
+4. **Run the simulator**
+
+   ```bash
+   python simulator.py -i data/results_j2025_ve_iof.xml -P 8080 --speed 2
+   ```
+
+5. **Open a dashboard**
+
+   Open `dashboard.html` in a browser — it connects to the WebSocket
+   and visualises the race in real time.
+
+   For Navisport mode see the usage modes in [simulator.md](simulator.md).
+
+---
+
+## Project layout
+
+```
+├─ simulator.py               # main simulation engine (see simulator.md)
+├─ listener.py                # local mock server (WS + Socket.IO)
+├─ server_ws.py               # (legacy) simple WebSocket server
+├─ dashboard.html             # example visualization
+├─ simulator.conf             # check-in queue config
+├─ simulator.md               # full documentation
+├─ README.md
+├─ utils/
+│   ├─ iof_to_navisport.py           # IOF XML → Navisport CSV
+│   ├─ fix_jukola_xml_date_values.py # fix Jukola date-offset bug
+│   ├─ iofvalidator.py               # validate against IOF v3 XSD
+│   ├─ extract_courses.py            # ResultList → CourseData
+│   └─ jukola_split_controls.html    # map split labels to control codes
+└─ data/
+    └─ results_j*.xml         # IOF3 files (gitignored)
+```
+
+---
+
+## Utilities (`utils/`)
+
+| Script | Purpose |
+|--------|---------|
+| `iof_to_navisport.py --iof <xml> --out <csv>` | Converts IOF XML to a Navisport CSV for bulk team/runner import. Maps bib numbers, names, leg assignments, and auto-generates chip numbers (`bib×10 + leg`). Supports 4-leg (Venla) and 7-leg (Jukola) events. |
+| `fix_jukola_xml_date_values.py <input> <output>` | Fixes date-offset errors in Jukola IOF XML files. The official Jukola results sometimes have incorrect day values in timestamps; this shifts dates past midnight by one day. |
+| `iofvalidator.py <xml>` | Validates an IOF XML file against the official IOF Data Standard v3 XSD schema. Downloads the schema automatically on first run (cached as `IOF.xsd`). Uses `lxml` for strict validation. |
+| `extract_courses.py --iof <xml> --out <courses.xml>` | Extracts course/control data from a ResultList XML into IOF CourseData format. With `--radat` and `--georef`, it also computes leg distances (haversine) and map pixel positions via bilinear interpolation. |
+| `jukola_split_controls.html` | Browser tool that maps Jukola/Venla split-time labels to actual control codes. Given a team page URL, it scrapes each runner's punch data and matches them to intermediate times using timing offsets. Exports results as CSV. |
 
 ---
 
 ## WebSocket Output
 
-Messages are sent as JSON. Example update:
+Messages are JSON. Basic types: `race_start`, `control_passed`,
+`leg_finished`, `race_end`.
 
 ```json
 {
@@ -117,50 +126,6 @@ Messages are sent as JSON. Example update:
   "time": "00:32:15"
 }
 ```
-
-Current message types include:
-
-* `race_start`
-* `control_passed`
-* `leg_finished`
-* `race_end`
-
----
-
-## Navisport Integration
-
-⚠️ **Note:** The current branch does **not** include a Navisport interface.
-Instead:
-
-* Data is exposed via WebSockets.
-* Conversion utilities (`iof_to_navisport.py`) demonstrate the path toward eventual Navisport compatibility.
-* Planned next steps include adding a Navisport connector or export format so simulations can be replayed directly in Navisport.
-
----
-
-## Development Notes
-
-* Language: Python 3
-* Key packages: `aiohttp`, `websockets`, XML parsing libraries
-* Extendable: you can add new exporters (e.g. to Navisport REST API once hooks are written).
-
----
-
-## Limitations
-
-* No direct Navisport output yet.
-* Simulation relies on static IOF result data (no live GPS, for example).
-* Dashboards are minimal demos.
-
----
-
-## Contributing
-
-Contributions are welcome, especially in:
-
-* Adding Navisport integration
-* Improving WebSocket protocol specification
-* Creating richer dashboards
 
 ---
 
