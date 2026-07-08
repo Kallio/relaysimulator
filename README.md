@@ -102,8 +102,8 @@ Fetch e.g. Jukola 2025 Venlat results:
 
 ```bash
 mkdir -p data
-curl -o data/results_j2025_ve_iof.xml \
-  https://results.jukola.com/tulokset/results_j2025_ve_iof.xml
+curl -o data/results_j2025_ju_iof.xml \
+  https://results.jukola.com/tulokset/results_j2025_ju_iof.xml
 ```
 
 The official XML sometimes includes wrong date values (midnight rollover
@@ -111,8 +111,13 @@ not reflected).  Fix if needed:
 
 ```bash
 python utils/fix_jukola_xml_date_values.py \
-  data/results_j2025_ve_iof.xml \
-  data/results_j2025_ve_iof_fixed.xml
+  data/results_j2025_ju_iof.xml \
+  data/results_j2025_ju_iof_fixed.xml
+```
+
+The official XML sometimes includes includes "illegal" chars, Fix if needed:
+```bash
+python utils/iofvalidator.py data/results_j2021_ju_iof.xml
 ```
 
 ### 3. Start the mock listener (for WebSocket mode)
