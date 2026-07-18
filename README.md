@@ -23,6 +23,8 @@ competition.
 * [`listener.py` — local mock server](#listenerpy--local-mock-server)
 * [WebSocket output](#websocket-output)
 * [Utilities](#utilities-utils)
+* [Analyzing existing results](#analyzing-existing-results)
+* [Generating artificial competitors](#generating-artificial-competitors)
 * [License](#license)
 
 ---
@@ -75,6 +77,8 @@ disabled:
 ├─ simulator.conf             # check-in queue config
 ├─ README.md
 ├─ utils/
+│   ├─ analyze_results.py               # analyze IOF-XML speed distributions
+│   ├─ create_artificial_competitors.py  # generate synthetic competitors
 │   ├─ iof_to_navisport.py           # IOF XML → Navisport CSV
 │   ├─ fix_jukola_xml_date_values.py # fix Jukola date-offset bug
 │   ├─ iofvalidator.py               # validate against IOF v3 XSD
@@ -604,11 +608,175 @@ Example:
 
 | Script | Purpose |
 |--------|---------|
+| `analyze_results.py --iof <xml>` | Analyzes an IOF-XML ResultList and reports speed distributions, top-N fastest runners, status rates, and segment variance per leg. Useful for calibrating the artificial competitor generator. |
+| `create_artificial_competitors.py --courses <xml>` | Generates a synthetic IOF-XML ResultList with artificial relay teams. Supports `--legs 1` for individual races, `--legs 4` for Venla, or `--legs 7` for Jukola. Speed calibration from real data, probabilistic DNF/MP/DSQ/DNS generation, and interactive prompts with educational defaults. |
 | `iof_to_navisport.py --iof <xml> --out <csv>` | Converts IOF XML to a Navisport CSV for bulk team/runner import.  Maps bib numbers, names, leg assignments, and auto-generates chip numbers (`bib×10 + leg`).  Supports 4-leg (Venla) and 7-leg (Jukola) events. |
 | `fix_jukola_xml_date_values.py <input> <output>` | Fixes date-offset errors in Jukola IOF XML files.  The official Jukola results sometimes have incorrect day values in timestamps; this shifts dates past midnight by one day. |
 | `iofvalidator.py <xml>` | Validates an IOF XML file against the official IOF Data Standard v3 XSD schema.  Downloads the schema automatically on first run (cached as `IOF.xsd`).  Uses `lxml` for strict validation. |
 | `extract_courses.py --iof <xml> --out <courses.xml>` | Extracts course/control data from a ResultList XML into IOF CourseData format.  With `--radat` and `--georef`, it also computes leg distances (haversine) and map pixel positions via bilinear interpolation. |
 | `jukola_split_controls.html` | Browser tool that maps Jukola/Venla split-time labels to actual control codes.  Given a team page URL, it scrapes each runner's punch data and matches them to intermediate times using timing offsets.  Exports results as CSV. |
+
+---
+
+## Analyzing existing results
+
+`utils/analyze_results.py` reads an IOF-XML ResultList and reports per-leg
+speed distributions, top-N fastest runners, and status rates.  Use it to
+calibrate the artificial competitor generator or to understand race dynamics.
+
+### Basic usage
+
+```bash
+# Top 10 fastest per leg with speed distributions
+python3 utils/analyze_results.py --iof data/results_j2025_ju_iof_fixed.xml
+
+# Top 20, show segment variance analysis
+python3 utils/analyze_results.py --iof data/results_j2025_ju_iof_fixed.xml --top 20 --segments
+
+# Machine-readable JSON output
+python3 utils/analyze_results.py --iof data/results_j2025_ju_iof_fixed.xml --format json --out stats.json
+```
+
+### Example output (excerpt)
+
+```
+═══ Leg 1 (1664 OK runners, course lengths: 12200m) ═══
+
+  Speed (km/h):
+    Min:  1.62    P10: 3.56    P25: 4.15    Median: 4.85
+    Mean: 4.93    P75: 5.56    P90: 6.62    Max: 8.00
+
+  Top 10 fastest:
+  #  Runner                    Club                  Dist    Time    km/h
+  1  Tveite Nils               NTNUI                12.2k   1:31:28  8.00
+  2  Olle Kalered              Stora Tuna OK        12.2k   1:31:29  8.00
+  ...
+
+  Speed calibration summary:
+    Overall median speed: 4.6 km/h
+    Overall top-10 avg:   9.8 km/h
+    Status rates: OK=87.6%, DNS=9.5%, DNF=1.1%, DSQ=1.7%
+```
+
+The calibration summary at the bottom gives you ready-to-use defaults for
+the `--dnf-rate`, `--mp-rate`, etc. flags when generating artificial
+competitors.
+
+---
+
+## Generating artificial competitors
+
+`utils/create_artificial_competitors.py` generates a fully synthetic
+IOF-XML ResultList from course/control data.  The output is compatible with
+`simulator.py` and passes IOF v3 XSD validation.
+
+### Quick start (with reference data)
+
+```bash
+# Quick start — generate 50 teams for Jukolan Viesti (7 legs)
+python3 utils/create_artificial_competitors.py \
+  --courses data/runners.j2025_ju_iof_fixed_courses.xml \
+  --ref-results data/results_j2025_ju_iof_fixed.xml \
+  --out data/artificial_jukola.xml \
+  --teams 50 --seed 42 --non-interactive
+
+# Individual race — one runner per team
+python3 utils/create_artificial_competitors.py \
+  --courses data/runners.j2025_ju_iof_fixed_courses.xml \
+  --ref-results data/results_j2025_ju_iof_fixed.xml \
+  --out data/artificial_individual.xml \
+  --teams 200 --legs 1 --seed 42 --non-interactive
+
+# Venla (4-leg relay)
+python3 utils/create_artificial_competitors.py \
+  --courses data/runners.j2025_ju_iof_fixed_courses.xml \
+  --ref-results data/results_j2025_ju_iof_fixed.xml \
+  --out data/artificial_venla.xml \
+  --teams 100 --legs 4 --seed 42 --non-interactive
+```
+
+This reads the real speed distribution from the reference ResultList and
+generates 50 teams (350 runners) with realistic speed spread, including
+DNF, MP, DSQ, and DNS outcomes at rates matching the real event.
+
+### Interactive mode
+
+When flags are omitted, the tool prompts with educational defaults derived
+from the reference data:
+
+```bash
+$ python3 utils/create_artificial_competitors.py \
+    --courses data/runners.j2025_ju_iof_fixed_courses.xml \
+    --ref-results data/results_j2025_ju_iof_fixed.xml
+
+Loaded 108 courses (7 legs available, using 7) — Jukolan Viesti
+Analyzing speed distribution from results_j2025_ju_iof_fixed.xml...
+
+  Per-leg speed (km/h) from reference data:
+    Leg 1: median=4.9, top10=8.0, P10=3.6
+    ...
+
+? Event name [Synthetic Jukolan Viesti]:
+? Number of teams [50]:
+? Speed mode [percentile]:
+? DNF rate [0.011]: 0.02
+? Random seed (empty for random): 42
+
+Generating 50 teams x 7 legs = 350 runners...
+  Status: OK=324, DNF=7, MP=4, DSQ=2, DNS=3
+Writing data/artificial_jukola.xml
+```
+
+When `--legs 1` is specified, the tool generates individual races where
+all runners start at the same time (no relay exchange). Use `--legs 4` for
+Venla-style 4-leg relays, or omit `--legs` to use all legs from CourseData.
+
+### Speed modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| `percentile` | `--speed-mode percentile` | Each runner gets a random percentile rank via beta distribution calibrated to the reference data. Naturally produces elite, mid-pack, and back-of-pack runners. (Default when `--ref-results` is provided.) |
+| `top10` | `--speed-mode top10` | Base speed = top-10 average from reference. Other runners are scaled as fractions of that. |
+| `manual` | `--speed-mode manual` | Single average speed + variance: `--avg-speed 6.5 --speed-variance 15`. No reference data needed. |
+
+### Status rates
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dnf-rate` | `0.02` | Probability per runner to DNF. DNF runners get truncated splits (they stop at a random control). |
+| `--mp-rate` | `0.01` | Probability of missing punch. One random interior control is removed from the split sequence. |
+| `--dsq-rate` | `0.005` | Probability of disqualification. Full splits are generated but status is set to `Disqualified`. |
+| `--dns-rate` | `0.01` | Probability of did-not-start. No splits or finish time. |
+
+When `--ref-results` is provided, the interactive prompts default to the
+actual rates from the reference event (e.g., Jukola 2025: DNS=9.5%,
+DNF=1.1%, DSQ=1.7%).
+
+### What gets generated
+
+- **Teams** with fictional Finnish/Swedish orienteering club names and
+  realistic person names
+- **Per-leg split times** distributed proportionally across controls with
+  per-segment noise for realism
+- **Runner-level speed consistency** — a fast runner is fast on all legs
+  (deterministic seed per runner)
+- **Relay exchange timing** — leg N+1 starts after the cumulative time of
+  previous legs
+- **Overall results** — cumulative time, position, and time-behind for
+  each team
+
+### Verification
+
+```bash
+# Validate against IOF XSD schema
+python3 iofvalidator.py data/artificial_jukola.xml
+
+# Parse test with the simulator
+python3 simulator.py --iof data/artificial_jukola.xml --limit-teams 5
+
+# Analyze the generated output
+python3 utils/analyze_results.py --iof data/artificial_jukola.xml
+```
 
 ---
 
